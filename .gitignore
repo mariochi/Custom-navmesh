@@ -1,0 +1,63 @@
+# Este .gitignore segue o padrão da comunidade Unity
+# (https://github.com/github/gitignore/blob/main/Unity.gitignore), com pequenos ajustes.
+
+# ==== Pastas geradas pelo Editor / build ====
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+
+# ==== Cache de packages (o manifest.json e o packages-lock.json continuam versionados) ====
+[Pp]ackages/*.orig
+
+# ==== Arquivos gerados por IDE (regenerados a partir do .sln/.slnx a cada Open C# Project) ====
+.vs/
+.vscode/
+*.csproj
+*.unityproj
+*.sln
+*.slnx
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# ==== Arquivos específicos do Rider ====
+.idea/
+
+# ==== Crash reports / logs de build ====
+sysinfo.txt
+*.stackdump
+
+# ==== Builds exportados (caso gere dentro do repo) ====
+*.apk
+*.aab
+*.unitypackage
+*.app
+
+# ==== Arquivos de sistema operacional ====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ==== Addressables (se o projeto passar a usar) ====
+/[Aa]ssets/[Aa]ddressable[Aa]ssets[Dd]ata/*/*.bin*
+/[Aa]ssets/[Aa]ddressable[Aa]ssets[Dd]ata/AssetGroups/Built/*
+
+# ==== Claude Code (settings.local.json é específico da máquina, não compartilhado) ====
+.claude/settings.local.json

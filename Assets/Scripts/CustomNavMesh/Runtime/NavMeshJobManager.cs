@@ -116,6 +116,8 @@ namespace CustomNavMesh
         NativeArray<byte> pathStatus;
         NativeArray<int> currentTriangle;
         NativeArray<float3> corridorFlat;
+        NativeArray<byte> movementFault; // MovementFaultType do frame atual, por agente — diagnóstico (ver AvoidanceAndMoveJob)
+        NativeArray<bool> movementFaultLogged; // já logamos esse agente pelo menos uma vez (evita spam no Console)
 
         // --- flow field: por agente (capacidade fixa) + pool de campos achatado (depende de TriangleCount) ---
         NativeArray<int> flowFieldSlot; // -1 = agente no modo corredor
@@ -183,6 +185,8 @@ namespace CustomNavMesh
             pathStatus = new NativeArray<byte>(capacity, Allocator.Persistent);
             currentTriangle = new NativeArray<int>(capacity, Allocator.Persistent);
             corridorFlat = new NativeArray<float3>(capacity * NavMeshJobConstants.MaxCorridorPoints, Allocator.Persistent);
+            movementFault = new NativeArray<byte>(capacity, Allocator.Persistent);
+            movementFaultLogged = new NativeArray<bool>(capacity, Allocator.Persistent);
             flowFieldSlot = new NativeArray<int>(capacity, Allocator.Persistent);
             flowFieldPersonalTarget = new NativeArray<float3>(capacity, Allocator.Persistent);
 
@@ -276,6 +280,8 @@ namespace CustomNavMesh
             if (pathStatus.IsCreated) pathStatus.Dispose();
             if (currentTriangle.IsCreated) currentTriangle.Dispose();
             if (corridorFlat.IsCreated) corridorFlat.Dispose();
+            if (movementFault.IsCreated) movementFault.Dispose();
+            if (movementFaultLogged.IsCreated) movementFaultLogged.Dispose();
             if (flowFieldSlot.IsCreated) flowFieldSlot.Dispose();
             if (flowFieldPersonalTarget.IsCreated) flowFieldPersonalTarget.Dispose();
             if (flowFieldDirections.IsCreated) flowFieldDirections.Dispose();
@@ -317,6 +323,8 @@ namespace CustomNavMesh
             corridorLength[index] = 0;
             pathStatus[index] = (byte)PathStatus.None;
             currentTriangle[index] = -1;
+            movementFault[index] = (byte)MovementFaultType.None;
+            movementFaultLogged[index] = false; // slot pode ter sido usado por outro agente antes (swap-remove reaproveita índice)
             flowFieldSlot[index] = -1;
 
             transformAccessArray.Add(agent.transform);
@@ -355,6 +363,8 @@ namespace CustomNavMesh
                 corridorLength[index] = corridorLength[last];
                 pathStatus[index] = pathStatus[last];
                 currentTriangle[index] = currentTriangle[last];
+                movementFault[index] = movementFault[last];
+                movementFaultLogged[index] = movementFaultLogged[last];
                 flowFieldSlot[index] = flowFieldSlot[last]; // RefCount do slot não muda — o agente que ocupava 'last' continua usando o mesmo slot, só migrou de índice
                 flowFieldPersonalTarget[index] = flowFieldPersonalTarget[last];
 
@@ -649,6 +659,49 @@ namespace CustomNavMesh
                 NativeArray<float3>.Copy(outPositions, positions, count);
                 NativeArray<float3>.Copy(velocities, prevVelocities, count);
             }
+
+            LogMovementFaults();
+        }
+
+        /// <summary>
+        /// Loga (uma vez por agente, pra não inundar o Console) qualquer MovementFault
+        /// detectado por AvoidanceAndMoveJob nesse frame. É a única forma de saber que um
+        /// travamento silencioso aconteceu — sem isso, nada em lugar nenhum acusa o problema
+        /// (Burst não lança exceção por NaN, e o agente simplesmente para de se mover).
+        /// </summary>
+        void LogMovementFaults()
+        {
+            for (int i = 0; i < count; i++)
+            {
+                var fault = (MovementFaultType)movementFault[i];
+
+                if (fault == MovementFaultType.None)
+                {
+                    movementFaultLogged[i] = false; // recuperado — a próxima ocorrência (se houver) loga de novo
+                    continue;
+                }
+
+                if (movementFaultLogged[i]) continue; // já avisado desta ocorrência, não repete todo frame
+                movementFaultLogged[i] = true;
+                string agentName = agentComponents[i] != null ? agentComponents[i].name : $"agente #{i}";
+
+                switch (fault)
+                {
+                    case MovementFaultType.InvalidVelocity:
+                        Debug.LogWarning($"NavMeshJobManager: velocidade inválida (NaN/Infinity) detectada em '{agentName}' " +
+                            $"e zerada antes de mover — provável triângulo degenerado no NavMesh baked ou combinação " +
+                            "extrema de posição/velocidade no avoidance. Não deveria se repetir; se persistir, avise.",
+                            agentComponents[i]);
+                        break;
+                    case MovementFaultType.LostNavMesh:
+                        Debug.LogWarning($"NavMeshJobManager: '{agentName}' perdeu a referência de triângulo no NavMesh " +
+                            "(nem o cache local nem a busca completa no grid acharam nada pra posição dele) — mantido " +
+                            "parado na última posição válida. Se ele não se recuperar sozinho em alguns frames, " +
+                            "ative Draw Status Gizmos pra ver onde ele está (esfera preta) e investigue a área.",
+                            agentComponents[i]);
+                        break;
+                }
+            }
         }
 
         /// <summary>
@@ -787,6 +840,7 @@ namespace CustomNavMesh
                     TimeHorizon = avoidanceTimeHorizon,
                     SteeringAccelerationFactor = steeringAccelerationFactor,
                     CrowdPushDamping = crowdPushDamping,
+                    MovementFault = movementFault,
                     FlowFieldIgnoresAvoidance = flowFieldIgnoresAvoidance,
                 }.Schedule(transformAccessArray, deps);
             }
@@ -808,6 +862,15 @@ namespace CustomNavMesh
                 {
                     Gizmos.color = StatusColor((PathStatus)pathStatus[i]);
                     Gizmos.DrawWireSphere(positions[i] + new float3(0f, 0.15f, 0f), radii[i] * 0.9f);
+
+                    // marcador extra (esfera preta sólida) por cima de qualquer agente com
+                    // MovementFault no frame atual — sobrepõe a cor de status normal, já que
+                    // isso é mais grave/raro (ver LogMovementFaults / MovementFaultType).
+                    if (movementFault[i] != (byte)MovementFaultType.None)
+                    {
+                        Gizmos.color = Color.black;
+                        Gizmos.DrawSphere(positions[i] + new float3(0f, 0.15f, 0f), radii[i] * 0.4f);
+                    }
                 }
             }
 

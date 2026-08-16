@@ -123,6 +123,10 @@ O `NavMeshJobManager` tem cinco toggles de Gizmo (Scene view, em Play mode):
   (início ou fim caiu fora da área coberta pelo NavMesh), ciano = `FlowField` (seguindo
   campo de grupo). **É o primeiro lugar pra olhar se um agente não se move** — se ele
   estiver vermelho ou magenta, o problema é o destino pedido, não o pipeline de movimento.
+  Uma esfera **preta sólida** por cima de qualquer uma dessas cores sinaliza um
+  `MovementFault` no frame atual (ver seção "Diagnóstico de travamentos silenciosos" abaixo)
+  — isso é mais grave que um status de path ruim, é o próprio pipeline de movimento tendo
+  produzido algo inválido.
 - **`Draw NavMesh Gizmo`** — wireframe da triangulação que o sistema está enxergando
   (útil pra confirmar que a área que você imagina baked realmente está sendo lida).
 - **`Draw Corridor Gizmos`** — linhas amarelas com o corredor calculado de cada agente
@@ -132,6 +136,46 @@ O `NavMeshJobManager` tem cinco toggles de Gizmo (Scene view, em Play mode):
   criados e ainda não chegaram/trocaram de destino). Também desenha uma esfera branca no
   destino bruto do comando e uma esfera magenta no ponto individual de cada agente
   daquele slot — dá pra ver visualmente o quanto a formação está "abrindo" o alvo.
+
+## Diagnóstico de travamentos silenciosos
+
+Sintoma raro reportado em produção: depois de algumas horas rodando, algum agente
+esporádico simplesmente para de se mover — sem nenhum erro no Console. Causa suspeita:
+`NaN`/`Infinity` se infiltrando na velocidade (triângulo degenerado no NavMesh baked, ou
+uma combinação extrema de posição/velocidade relativa no avoidance). O grave de `NaN` é
+que ele nunca lança exceção e **toda comparação `<` com `NaN` dá falso** — então a busca
+de "qual triângulo está mais perto dessa posição" nunca encontra nada pra uma posição
+`NaN`, o agente perde a referência de triângulo pra sempre, e nada em lugar nenhum
+detectava isso antes desta seção existir.
+
+O que foi adicionado (`AvoidanceAndMoveJob` + `MovementFaultType`):
+
+- **Detecção**: depois de calcular a velocidade (avoidance + flow field/corredor), checa
+  `NaN`/`Infinity` explicitamente. Se achar, zera a velocidade desse frame em vez de
+  deixar propagar, e sinaliza `MovementFaultType.InvalidVelocity`.
+- **Autorrecuperação de posição**: `ClampToNavMesh` agora, se não achar NENHUM triângulo
+  (nem no cache local, nem na busca completa do grid), **não aceita** a posição nova
+  (pode estar corrompida ou fora da malha) — mantém o agente na última posição confirmada
+  válida do início do frame, e preserva a última referência de triângulo válida (não
+  sobrescreve com -1) pra dar ao próximo frame a melhor chance de reconectar. Sinaliza
+  `MovementFaultType.LostNavMesh`.
+- **Autorrecuperação de velocidade suavizada**: `SmoothVelocity` também checa se a
+  velocidade do frame anterior já estava com `NaN` (caso a corrupção tenha acontecido
+  antes desse fix existir) e pula a suavização nesse caso, pra não misturar `NaN` com um
+  valor limpo.
+- **Visibilidade**: `NavMeshJobManager` loga um `Debug.LogWarning` (uma vez por ocorrência,
+  não todo frame) identificando o agente e o tipo de falha, e desenha uma esfera preta
+  sólida sobre ele (`Draw Status Gizmos`) enquanto o `MovementFault` persistir.
+
+Se isso disparar de novo: o log te diz exatamente qual agente e qual dos dois tipos —
+`InvalidVelocity` aponta pra matemática do avoidance/campo de fluxo produzindo `NaN`;
+`LostNavMesh` aponta pra uma posição que saiu longe demais da malha num frame só (ex.:
+empurrão de avoidance grande demais, ou teleporte externo do Transform sem passar por
+`SetDestination`/`MoveGroupWithFlowField`). Isso não deveria mais travar o agente pra
+sempre — ele fica visível e, na maioria dos casos, se recupera sozinho em poucos frames;
+se um agente ficar com a esfera preta por muito tempo seguido, é sinal de que está
+genuinamente preso fora do NavMesh (não um solavanco de 1 frame), e vale investigar a
+geometria da área onde ele está.
 
 ## Arquitetura
 
@@ -284,3 +328,4 @@ de calibração pra esse tamanho de mapa é o **broad-phase**, não o pathfindin
 | `Runtime/NavMeshJobManager.cs` | Orquestrador (singleton por cena). |
 | `Runtime/CustomNavMeshAgent.cs` | Componente por agente. |
 | `Runtime/PathStatus.cs` | Enum de status de caminho. |
+| `Runtime/MovementFaultType.cs` | Enum de falha de movimento (NaN/perda de NavMesh) — diagnóstico, ver "Diagnóstico de travamentos silenciosos". |

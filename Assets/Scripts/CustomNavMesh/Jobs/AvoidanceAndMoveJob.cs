@@ -117,8 +117,18 @@ namespace CustomNavMesh
         /// </summary>
         public float CrowdPushDamping;
 
+        /// <summary>
+        /// Diagnóstico por agente pro frame atual (ver MovementFaultType) — 0/None é o caso
+        /// normal. Escrito aqui, lido pelo NavMeshJobManager (main thread, pós-Complete) pra
+        /// logar e mostrar no gizmo. Existe porque um travamento silencioso (NaN se propagando
+        /// por comparações que sempre dão falso, ou um agente perdendo a referência de
+        /// triângulo) não lançava exceção nem aparecia em lugar nenhum antes disso.
+        /// </summary>
+        public NativeArray<byte> MovementFault;
+
         public void Execute(int index, TransformAccess transform)
         {
+            MovementFault[index] = (byte)MovementFaultType.None;
             float3 pos = Positions[index];
             int ffSlot = FlowFieldSlot[index];
 
@@ -165,6 +175,17 @@ namespace CustomNavMesh
 
             float3 newVel = neighborCount > 0 ? prefVel + avoidanceSum / neighborCount : prefVel;
 
+            // rede de segurança: se algum cálculo acima (avoidance, tempo-até-colisão, campo de
+            // fluxo) produziu NaN/Infinity, NÃO deixa propagar — a partir daqui NaN comparado
+            // com qualquer coisa via '<' dá sempre falso, então a busca de triângulo mais
+            // próximo nunca acharia nada e o agente ficaria travado pra sempre, em silêncio
+            // (nada lança exceção em Burst por causa de NaN). Zera e sinaliza em vez disso.
+            if (math.any(math.isnan(newVel)) || math.any(math.isinf(newVel)))
+            {
+                newVel = float3.zero;
+                MovementFault[index] = (byte)MovementFaultType.InvalidVelocity;
+            }
+
             float newSpeed = math.length(newVel);
             if (newSpeed > MaxSpeeds[index])
                 newVel = newVel / newSpeed * MaxSpeeds[index];
@@ -175,7 +196,7 @@ namespace CustomNavMesh
             newVel = SmoothVelocity(PrevVelocities[index], newVel, MaxSpeeds[index] * SteeringAccelerationFactor);
 
             float3 newPos = pos + newVel * DeltaTime;
-            newPos = ClampToNavMesh(index, newPos); // rente à malha — usado como verdade pra simulação
+            newPos = ClampToNavMesh(index, pos, newPos); // rente à malha — usado como verdade pra simulação
 
             transform.position = newPos + new float3(0f, Heights[index], 0f); // só o visual sobe
             OutPositions[index] = newPos;
@@ -224,6 +245,13 @@ namespace CustomNavMesh
         float3 SmoothVelocity(float3 current, float3 desired, float maxAcceleration)
         {
             if (maxAcceleration <= 0f) return desired; // 0 = suavização desligada, comportamento antigo
+
+            // se 'current' (velocidade do frame anterior) já estiver com NaN — de antes deste
+            // fix existir, por exemplo — não tenta suavizar a partir de um valor corrompido
+            // (NaN + qualquer coisa = NaN, ia propagar pra sempre). Pula direto pro valor
+            // desejado (já sabemos que está limpo, checado antes desta chamada).
+            if (math.any(math.isnan(current)))
+                return desired;
 
             float3 delta = desired - current;
             float deltaLen = math.length(delta);
@@ -317,7 +345,12 @@ namespace CustomNavMesh
             return t >= 0f ? t : -1f;
         }
 
-        float3 ClampToNavMesh(int index, float3 newPos)
+        /// <summary>
+        /// 'safePos' é a posição confirmada válida do início do frame (antes de integrar
+        /// velocidade) — usada como fallback se nada abaixo achar um triângulo, em vez de
+        /// aceitar 'newPos' (que pode estar fora da malha ou corrompida).
+        /// </summary>
+        float3 ClampToNavMesh(int index, float3 safePos, float3 newPos)
         {
             int tri = CurrentTriangle[index];
 
@@ -333,8 +366,20 @@ namespace CustomNavMesh
             }
 
             int nearest = NavMeshQueryUtil.FindNearestTriangle(newPos, TriGrid, NavVertices, NavTriangles, out float3 cp2);
-            CurrentTriangle[index] = nearest;
-            return nearest >= 0 ? cp2 : newPos;
+            if (nearest >= 0)
+            {
+                CurrentTriangle[index] = nearest;
+                return cp2;
+            }
+
+            // não achou NENHUM triângulo — nem no cache+vizinhos, nem na busca completa do
+            // grid espacial. NÃO sobrescreve CurrentTriangle com -1 (preserva a última
+            // referência válida, dá ao próximo frame a melhor chance de reconectar pelo
+            // caminho rápido) e NÃO aceita 'newPos' — mantém o agente parado na última posição
+            // confirmada válida. Sinaliza pro manager logar; se persistir por muitos frames,
+            // é um agente genuinamente preso fora do NavMesh, não um solavanco de 1 frame.
+            MovementFault[index] = (byte)MovementFaultType.LostNavMesh;
+            return safePos;
         }
 
         int TestTriangleAndNeighbors(int tri, float3 p, out float3 closest, out float distSq)

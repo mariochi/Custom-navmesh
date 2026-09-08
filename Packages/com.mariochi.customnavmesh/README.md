@@ -204,27 +204,35 @@ bool pending = agent.IsPathPending;        // true enquanto o pedido de repath e
 o triângulo de destino, não o caminho exato até o ponto de formação do agente) — exata só
 no modo corredor individual.
 
-## Rebuild automático quando o NavMesh muda
+## Rebuild quando o NavMesh muda
 
 Se o jogo faz carving em runtime (`NavMeshObstacle`, portões, barreiras mágicas, etc.), o
-`NavMeshJobManager` pode se manter sincronizado sozinho:
+grafo do pacote precisa ser reconstruído — mas isso **não acontece sozinho**. Não existe
+um jeito confiável de detectar "o NavMesh mudou" sem o jogo avisar: o candidato óbvio,
+`NavMesh.onPreUpdate`, dispara a cada tick do subsistema de navegação do Unity — ou seja,
+dispara mesmo quando nada mudou, então não dá pra diferenciar "mudou" de "só rodou o
+tick" só com esse evento (uma versão anterior deste README/código tentava usar isso com
+debounce e o mecanismo ficava permanentemente travado: o evento reempurrava o prazo do
+debounce antes da janela conseguir fechar, então o rebuild nunca disparava de verdade —
+obrigado a quem revisou e pegou isso).
 
-- **`Auto Rebuild On NavMesh Change`** (default `true`): inscreve no
-  `UnityEngine.AI.NavMesh.onPreUpdate` (evento estático disparado sempre que o Unity
-  processa atualização de NavMesh, incluindo carving) e chama `RebuildGraph()` +
-  `RepathAllAgents()` automaticamente. Fecha o ciclo "portão fechou → malha recarva →
-  grafo do pacote atualiza → bots recalculam caminho" sem o jogo precisar saber que o
-  pacote existe.
-- **`Auto Rebuild Debounce`** (default 0.25s): várias mudanças em sequência rápida (vários
-  obstáculos entrando juntos) viram uma única reconstrução, não uma por frame.
-- Desligue o toggle se preferir chamar `RebuildGraph()` manualmente (ex.: só depois de uma
-  leva grande de mudanças, pra ter controle fino de quando o custo é pago).
-
-Se preferir/precisar de controle manual (ou o auto-rebuild estiver desligado), as duas
-peças continuam expostas separadamente:
+O gatilho é explícito — chame quando **souber** que algo mudou (o próprio script do
+portão/obstáculo, no momento em que ele liga/desliga):
 
 ```csharp
-NavMeshJobManager.Instance.RebuildGraph();               // reconstrói o grafo a partir do NavMesh atual
+NavMeshJobManager.Instance.NotifyNavMeshChanged();
+```
+
+- Debounced (`Auto Rebuild Debounce`, default 0.25s): várias chamadas em sequência rápida
+  (vários obstáculos mudando juntos) viram uma única reconstrução.
+- `Auto Rebuild On NavMesh Change` (default `true`) é um master switch — desligado, as
+  chamadas a `NotifyNavMeshChanged()` são ignoradas (útil pra desligar tudo de uma vez em
+  debug/profiling sem precisar tirar a chamada do código do jogo).
+- Por baixo dos panos, chama `RebuildGraph()` + `RepathAllAgents()` — as duas peças
+  continuam expostas separadamente se você quiser controle mais fino:
+
+```csharp
+NavMeshJobManager.Instance.RebuildGraph();               // reconstrói o grafo a partir do NavMesh atual (síncrono, sem debounce)
 NavMeshJobManager.Instance.RepathAllAgents();             // força recálculo de quem tem destino ativo (modo corredor)
 NavMeshJobManager.Instance.RepathAgentsNear(point, 10f);  // versão barata: só quem está perto do que mudou
 ```
@@ -237,12 +245,6 @@ um novo destino). `RepathAllAgents`/`RepathAgentsNear` ignoram agentes sem desti
 (nada pra recalcular) e agentes em flow field (um `RebuildGraph()` já tira todo mundo do
 flow field automaticamente — se o grupo ainda precisa se mover, chame
 `MoveGroupWithFlowField` de novo).
-
-> **Nota de verificação**: `NavMesh.onPreUpdate` é a API pública que uso de memória pra
-> esse hook — não tive como compilar num Editor real pra confirmar contra a versão exata
-> do seu projeto. Se o símbolo não existir/tiver mudado de nome na sua versão do Unity, o
-> erro de compilação vai apontar exatamente essa linha em `NavMeshJobManager.OnEnable()`;
-> me avisa o nome certo que eu ajusto.
 
 ## Debug visual
 

@@ -4,7 +4,6 @@ using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
-using UnityEngine.AI;
 using UnityEngine.Jobs;
 
 namespace CustomNavMesh
@@ -43,14 +42,14 @@ namespace CustomNavMesh
             "garante índice de vértice compartilhado na costura entre tiles do NavMesh (comum em mapas " +
             "grandes) — sem soldar, cada tile vira uma ilha isolada e o A* nunca acha caminho entre eles.")]
         [SerializeField] float vertexWeldEpsilon = NavMeshGraphBuilder.DefaultWeldEpsilon;
-        [Tooltip("Se marcado, o manager reconstrói o grafo sozinho (RebuildGraph + RepathAllAgents) " +
-            "sempre que o NavMesh mudar em runtime (NavMeshObstacle fazendo carving, NavMeshLink " +
-            "ativado/desativado, etc.) — inscrito em NavMesh.onPreUpdate. Várias mudanças próximas no " +
-            "tempo viram uma única reconstrução (ver Auto Rebuild Debounce). Desligue se preferir " +
-            "controlar manualmente quando chamar RebuildGraph().")]
+        [Tooltip("Master switch pro mecanismo de NotifyNavMeshChanged(): se desligado, chamadas a " +
+            "esse método são ignoradas (útil pra desligar tudo de uma vez em debug/profiling). Não " +
+            "existe detecção automática de mudança no NavMesh — o jogo precisa chamar " +
+            "NotifyNavMeshChanged() explicitamente quando um NavMeshObstacle/portão muda (ver README, " +
+            "'Rebuild automático quando o NavMesh muda', pra saber por que não dá pra fazer isso sozinho).")]
         [SerializeField] bool autoRebuildOnNavMeshChange = true;
-        [Tooltip("Janela de silêncio (segundos) depois da última mudança detectada no NavMesh antes " +
-            "de reconstruir o grafo — evita reconstruir uma vez por frame quando várias mudanças " +
+        [Tooltip("Janela de silêncio (segundos) depois da última chamada a NotifyNavMeshChanged() antes " +
+            "de reconstruir o grafo — evita reconstruir uma vez por chamada quando várias mudanças " +
             "acontecem em sequência rápida (ex.: vários NavMeshObstacle entrando em cena juntos).")]
         [SerializeField] float autoRebuildDebounce = 0.25f;
 
@@ -176,28 +175,37 @@ namespace CustomNavMesh
         Coroutine autoRebuildCoroutine;
         float autoRebuildDeadline;
 
-        void OnEnable()
-        {
-            // NavMesh.onPreUpdate dispara todo frame em que o Unity processa atualização de
-            // NavMesh — inclusive carving de NavMeshObstacle e NavMeshLink ligando/desligando.
-            // É a forma pública de saber "algo pode ter mudado" sem o jogo precisar chamar
-            // RebuildGraph() manualmente toda vez que mexe num obstáculo/portão.
-            NavMesh.onPreUpdate += HandleNavMeshPreUpdate;
-        }
-
         void OnDisable()
         {
-            NavMesh.onPreUpdate -= HandleNavMeshPreUpdate;
+            // se o GameObject for desativado com a corrotina de debounce em voo, o Unity mata a
+            // corrotina sozinho mas NÃO zera nossa referência — sem isso, NotifyNavMeshChanged()
+            // acharia (errado) que ainda tem uma corrotina rodando depois de reativado, e o
+            // debounce ficaria travado pra sempre (nunca mais chamando StartCoroutine de novo).
+            autoRebuildCoroutine = null;
         }
 
-        void HandleNavMeshPreUpdate()
+        /// <summary>
+        /// Chame isso quando SOUBER que o NavMesh mudou em runtime — um NavMeshObstacle ligou/
+        /// desligou carving, um NavMeshLink foi ativado, um portão fechou, etc. Agenda um
+        /// RebuildGraph() + RepathAllAgents() debounced (várias chamadas em sequência rápida
+        /// viram uma única reconstrução, ver Auto Rebuild Debounce). Ignorado se Auto Rebuild On
+        /// NavMesh Change estiver desligado no inspector.
+        ///
+        /// NÃO existe uma forma confiável de detectar "o NavMesh mudou" automaticamente: o
+        /// candidato óbvio, NavMesh.onPreUpdate, dispara a cada tick do subsistema de navegação
+        /// do Unity — ou seja, também dispara quando NADA mudou — então não dá pra diferenciar
+        /// "mudou" de "só rodou o tick" só com esse evento (uma versão anterior deste método
+        /// tentava usar isso com debounce e ficava presa: o prazo nunca vencia, porque o evento
+        /// reempurrava o debounce de novo antes da janela fechar). Por isso o gatilho é explícito.
+        /// </summary>
+        public void NotifyNavMeshChanged()
         {
             if (!autoRebuildOnNavMeshChange) return;
 
             // debounce: cada chamada empurra o prazo pra frente; a corrotina só executa o
             // rebuild de fato depois de 'autoRebuildDebounce' segundos SEM nenhuma chamada nova
             // — várias mudanças em sequência rápida (vários obstáculos entrando juntos) viram
-            // uma única reconstrução em vez de uma por frame.
+            // uma única reconstrução em vez de uma por chamada.
             autoRebuildDeadline = Time.time + autoRebuildDebounce;
             if (autoRebuildCoroutine == null)
                 autoRebuildCoroutine = StartCoroutine(AutoRebuildDebounced());

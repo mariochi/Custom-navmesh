@@ -182,6 +182,28 @@ agent.ClearAvoidanceOverride(); // normalmente desnecessário — some sozinho s
   muito maior que ~1.5× `Neighbor Cell Size` não vai enxergar vizinhos além dessa janela;
   se precisar de raios bem maiores, suba `Neighbor Cell Size` também.
 
+### Velocidade explícita (strafe / dodge / knockback / step)
+
+```csharp
+agent.SetVelocityOverride(direction * speed); // válido só ESTE frame, mesmo contrato de SetAvoidanceOverride
+agent.ClearVelocityOverride(); // normalmente desnecessário — some sozinho se parar de chamar
+```
+
+Substitui a busca ativa de corredor/flow field por uma velocidade explícita, pra ações de
+combate que setavam `NavMeshAgent.velocity` direto no sistema padrão do Unity (strafe,
+dodge, knockback, "andar pra frente" numa animação de ataque). O agente continua dentro do
+sistema — ainda clampado na malha (`ClampToNavMesh` roda incondicionalmente, não atravessa
+parede), ainda sofre avoidance dos vizinhos (levemente desviado se for atravessar outro
+agente) — mas pula o clamp de `MaxSpeed` (knockback precisa poder exceder a velocidade
+normal de corrida) e a suavização de aceleração (`Steering Acceleration Factor`): é pra ser
+instantâneo, sem rampa, igual `.velocity =` direto era.
+
+**Tem prioridade sobre `Pause()`**: um agente pausado ainda se move se isso for chamado
+nele — é assim que um ataque corpo-a-corpo consegue pausar o corredor (trava a busca ativa)
+e empurrar o personagem pra frente no mesmo frame. Não mexe em `CorridorCursor`/flow
+field — quando você parar de chamar, o agente retoma o corredor de onde estava, exatamente
+como acontece com `Pause()`/`Resume()`.
+
 ### Raio/altura/velocidade ao vivo
 
 `Radius`, `Height`, `MaxSpeed` e `WaypointReachDistance` agora propagam pro job
@@ -198,11 +220,18 @@ agent.Radius = crouching ? 0.3f : 0.5f; // já reflete no avoidance a partir do 
 ```csharp
 float remaining = agent.RemainingDistance; // soma dos segmentos entre o waypoint atual e o fim do corredor
 bool pending = agent.IsPathPending;        // true enquanto o pedido de repath está na fila (budget de Max Path Requests Per Frame)
+bool onMesh = agent.IsOnNavMesh;           // leitura O(1) — não faz nenhuma consulta nova, só reflete o triângulo já rastreado por frame
 ```
 
 `RemainingDistance` no modo flow field é uma aproximação (distância-ao-longo-do-campo até
 o triângulo de destino, não o caminho exato até o ponto de formação do agente) — exata só
-no modo corredor individual.
+no modo corredor individual. `IsOnNavMesh` é o equivalente a `NavMeshAgent.isOnNavMesh`,
+mas de graça: como todo agente já rastreia seu triângulo atual por frame (pro clamp de
+superfície), essa propriedade só olha esse dado — nada de `NavMesh.SamplePosition` síncrono
+por trás, então é seguro chamar todo frame por agente sem reintroduzir o gargalo de main
+thread que o pacote existe pra evitar. Só fica `false` depois de um `MovementFaultType.LostNavMesh`
+persistente (ver "Diagnóstico de travamentos silenciosos") ou antes do primeiro frame do
+agente rodar.
 
 ## Rebuild quando o NavMesh muda
 

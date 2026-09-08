@@ -138,19 +138,29 @@ namespace CustomNavMesh
         /// <summary>Override por agente de TimeHorizon; -1 = usa o valor global.</summary>
         [ReadOnly] public NativeArray<float> TimeHorizonOverride;
 
+        /// <summary>Velocidade explícita (strafe/dodge/knockback/step) — só vale se HasVelocityOverride[i]. Tem prioridade sobre Paused: substitui o prefVel inteiro, corredor/flow field não são tocados.</summary>
+        [ReadOnly] public NativeArray<float3> VelocityOverride;
+        [ReadOnly] public NativeArray<bool> HasVelocityOverride;
+
         public void Execute(int index, TransformAccess transform)
         {
             MovementFault[index] = (byte)MovementFaultType.None;
             float3 pos = Positions[index];
             int ffSlot = FlowFieldSlot[index];
 
-            // pausado: não avança corredor/flow field (não chama Compute*PrefVel — CorridorCursor
-            // e afins ficam exatamente como estavam), só zera a velocidade de busca. O avoidance
-            // roda igual logo abaixo, então o agente ainda reage se for empurrado.
+            // ordem de prioridade: override de velocidade > pausado > corredor/flow field normal.
+            // Nos dois primeiros casos NÃO chama Compute*PrefVel — CorridorCursor/flow field ficam
+            // exatamente como estavam, então quando o override parar (ou Resume() for chamado), o
+            // agente retoma de onde parou. O avoidance roda igual logo abaixo em qualquer caso —
+            // mesmo com velocidade explícita, o agente ainda é levemente desviado se for atravessar
+            // outro agente, e outros ainda o veem como obstáculo.
+            bool hasOverride = HasVelocityOverride[index];
             bool isPaused = Paused[index];
-            float3 prefVel = isPaused
-                ? float3.zero
-                : (ffSlot >= 0 ? ComputeFlowFieldPrefVel(index, ffSlot, pos) : ComputeCorridorPrefVel(index, pos));
+            float3 prefVel = hasOverride
+                ? VelocityOverride[index]
+                : (isPaused
+                    ? float3.zero
+                    : (ffSlot >= 0 ? ComputeFlowFieldPrefVel(index, ffSlot, pos) : ComputeCorridorPrefVel(index, pos)));
 
             // Acumula a contribuição de CADA vizinho contra a MESMA velocidade preferida fixa
             // (não uma 'vel' sendo mutada a cada vizinho processado) e tira a média no final —
@@ -213,14 +223,22 @@ namespace CustomNavMesh
                 MovementFault[index] = (byte)MovementFaultType.InvalidVelocity;
             }
 
-            float newSpeed = math.length(newVel);
-            if (newSpeed > MaxSpeeds[index])
-                newVel = newVel / newSpeed * MaxSpeeds[index];
+            // com override de velocidade, pula o clamp de MaxSpeed (knockback precisa poder
+            // exceder a velocidade normal de corrida) e a suavização de aceleração (nenhum dos
+            // usos — strafe/dodge/knockback/step — quer o atraso de rampa; é pra ser instantâneo,
+            // igual '.velocity =' direto era no NavMeshAgent padrão). ClampToNavMesh, logo abaixo,
+            // continua rodando incondicionalmente de qualquer forma — nada disso atravessa parede.
+            if (!hasOverride)
+            {
+                float newSpeed = math.length(newVel);
+                if (newSpeed > MaxSpeeds[index])
+                    newVel = newVel / newSpeed * MaxSpeeds[index];
 
-            // suaviza a transição a partir da velocidade do frame anterior em vez de saltar
-            // direto pra velocidade desejada — é isso que tira o zigue-zague/solavanco de
-            // mudanças bruscas de direção alvo (cruzar de triângulo, convergência de grupo).
-            newVel = SmoothVelocity(PrevVelocities[index], newVel, MaxSpeeds[index] * SteeringAccelerationFactor);
+                // suaviza a transição a partir da velocidade do frame anterior em vez de saltar
+                // direto pra velocidade desejada — é isso que tira o zigue-zague/solavanco de
+                // mudanças bruscas de direção alvo (cruzar de triângulo, convergência de grupo).
+                newVel = SmoothVelocity(PrevVelocities[index], newVel, MaxSpeeds[index] * SteeringAccelerationFactor);
+            }
 
             float3 newPos = pos + newVel * DeltaTime;
             newPos = ClampToNavMesh(index, pos, newPos); // rente à malha — usado como verdade pra simulação

@@ -133,6 +133,8 @@ namespace CustomNavMesh
         NativeArray<bool> ignoreAvoidance; // por agente, permanente até trocar de novo
         NativeArray<float> neighborRadiusOverride; // -1 = usa o global; resetado todo frame em LateUpdate (válido só 1 frame)
         NativeArray<float> timeHorizonOverride; // -1 = usa o global; idem
+        NativeArray<float3> velocityOverride; // válido só se hasVelocityOverride[i] — resetado todo frame em LateUpdate
+        NativeArray<bool> hasVelocityOverride;
 
         // --- flow field: por agente (capacidade fixa) + pool de campos achatado (depende de TriangleCount) ---
         NativeArray<int> flowFieldSlot; // -1 = agente no modo corredor
@@ -259,6 +261,8 @@ namespace CustomNavMesh
             ignoreAvoidance = new NativeArray<bool>(capacity, Allocator.Persistent);
             neighborRadiusOverride = new NativeArray<float>(capacity, Allocator.Persistent);
             timeHorizonOverride = new NativeArray<float>(capacity, Allocator.Persistent);
+            velocityOverride = new NativeArray<float3>(capacity, Allocator.Persistent);
+            hasVelocityOverride = new NativeArray<bool>(capacity, Allocator.Persistent);
             flowFieldSlot = new NativeArray<int>(capacity, Allocator.Persistent);
             flowFieldPersonalTarget = new NativeArray<float3>(capacity, Allocator.Persistent);
 
@@ -404,6 +408,8 @@ namespace CustomNavMesh
             if (ignoreAvoidance.IsCreated) ignoreAvoidance.Dispose();
             if (neighborRadiusOverride.IsCreated) neighborRadiusOverride.Dispose();
             if (timeHorizonOverride.IsCreated) timeHorizonOverride.Dispose();
+            if (velocityOverride.IsCreated) velocityOverride.Dispose();
+            if (hasVelocityOverride.IsCreated) hasVelocityOverride.Dispose();
             if (flowFieldSlot.IsCreated) flowFieldSlot.Dispose();
             if (flowFieldPersonalTarget.IsCreated) flowFieldPersonalTarget.Dispose();
             if (flowFieldDirections.IsCreated) flowFieldDirections.Dispose();
@@ -451,6 +457,7 @@ namespace CustomNavMesh
             ignoreAvoidance[index] = agent.IgnoreAvoidance; // AgentIndex do 'agent' ainda é -1 aqui, então o getter lê o campo serializado local
             neighborRadiusOverride[index] = -1f;
             timeHorizonOverride[index] = -1f;
+            hasVelocityOverride[index] = false;
             flowFieldSlot[index] = -1;
 
             transformAccessArray.Add(agent.transform);
@@ -495,6 +502,8 @@ namespace CustomNavMesh
                 ignoreAvoidance[index] = ignoreAvoidance[last];
                 neighborRadiusOverride[index] = neighborRadiusOverride[last];
                 timeHorizonOverride[index] = timeHorizonOverride[last];
+                velocityOverride[index] = velocityOverride[last];
+                hasVelocityOverride[index] = hasVelocityOverride[last];
                 flowFieldSlot[index] = flowFieldSlot[last]; // RefCount do slot não muda — o agente que ocupava 'last' continua usando o mesmo slot, só migrou de índice
                 flowFieldPersonalTarget[index] = flowFieldPersonalTarget[last];
 
@@ -591,6 +600,31 @@ namespace CustomNavMesh
             if (index < 0 || index >= count) return;
             neighborRadiusOverride[index] = -1f;
             timeHorizonOverride[index] = -1f;
+        }
+
+        /// <summary>
+        /// Substitui a busca ativa de corredor/flow field por uma velocidade explícita — pra
+        /// strafe, dodge, knockback, "andar pra frente" sem soltar o agente do sistema (continua
+        /// clampado na malha, ainda sofre avoidance dos vizinhos, mas pula o clamp de MaxSpeed e
+        /// a suavização de aceleração — é pra ser instantâneo). Válido só até o próximo LateUpdate
+        /// resetar (mesmo contrato de SetAvoidanceOverride) — chame de novo todo frame enquanto
+        /// quiser mantê-lo. Tem prioridade sobre Pause(): um agente pausado ainda se move se isso
+        /// for chamado nele (é assim que um ataque corpo-a-corpo pausa o corredor e empurra o
+        /// personagem pra frente no mesmo frame). Não mexe em CorridorCursor/flow field — quando
+        /// parar de chamar, o agente retoma o corredor de onde estava.
+        /// </summary>
+        public void SetVelocityOverride(int index, Vector3 velocity)
+        {
+            if (index < 0 || index >= count) return;
+            velocityOverride[index] = velocity;
+            hasVelocityOverride[index] = true;
+        }
+
+        /// <summary>Normalmente desnecessário — expira sozinho se você simplesmente parar de chamar SetVelocityOverride.</summary>
+        public void ClearVelocityOverride(int index)
+        {
+            if (index < 0 || index >= count) return;
+            hasVelocityOverride[index] = false;
         }
 
         public float GetRadius(int index) => index >= 0 && index < count ? radii[index] : 0f;
@@ -853,6 +887,9 @@ namespace CustomNavMesh
         public float3 GetVelocity(int index) =>
             index >= 0 && index < count ? velocities[index] : float3.zero;
 
+        /// <summary>Leitura O(1) — não faz nenhuma consulta nova, só reflete o triângulo já rastreado por frame (ver AvoidanceAndMoveJob.ClampToNavMesh). false só depois de um MovementFaultType.LostNavMesh persistente, ou antes do 1º frame do agente ter rodado.</summary>
+        public bool GetIsOnNavMesh(int index) => index >= 0 && index < count && currentTriangle[index] >= 0;
+
         public bool HasReachedEnd(int index)
         {
             if (index < 0 || index >= count) return false;
@@ -900,23 +937,24 @@ namespace CustomNavMesh
             }
 
             LogMovementFaults();
-            ExpireAvoidanceOverrides();
+            ExpirePerFrameOverrides();
         }
 
         /// <summary>
-        /// SetAvoidanceOverride é "válido só neste frame" por design: o job deste frame já
-        /// consumiu os valores atuais (Update -> ScheduleFrameJobs, antes de qualquer script de
-        /// gameplay de execution order default rodar), então é seguro resetar pra -1 aqui — quem
-        /// quiser manter o override simplesmente chama SetAvoidanceOverride nele nesse mesmo
-        /// frame, definindo o valor que vale pro PRÓXIMO frame (mesmo atraso de 1 frame que já
-        /// existe em Positions/PrevVelocities).
+        /// SetAvoidanceOverride/SetVelocityOverride são "válidos só neste frame" por design: o
+        /// job deste frame já consumiu os valores atuais (Update -> ScheduleFrameJobs, antes de
+        /// qualquer script de gameplay de execution order default rodar), então é seguro resetar
+        /// aqui — quem quiser manter o override simplesmente chama de novo nesse mesmo frame,
+        /// definindo o valor que vale pro PRÓXIMO frame (mesmo atraso de 1 frame que já existe em
+        /// Positions/PrevVelocities).
         /// </summary>
-        void ExpireAvoidanceOverrides()
+        void ExpirePerFrameOverrides()
         {
             for (int i = 0; i < count; i++)
             {
                 neighborRadiusOverride[i] = -1f;
                 timeHorizonOverride[i] = -1f;
+                hasVelocityOverride[i] = false;
             }
         }
 
@@ -1103,6 +1141,8 @@ namespace CustomNavMesh
                     IgnoreAvoidance = ignoreAvoidance,
                     NeighborRadiusOverride = neighborRadiusOverride,
                     TimeHorizonOverride = timeHorizonOverride,
+                    VelocityOverride = velocityOverride,
+                    HasVelocityOverride = hasVelocityOverride,
                 }.Schedule(transformAccessArray, deps);
             }
 

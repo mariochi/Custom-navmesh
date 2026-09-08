@@ -153,6 +153,9 @@ namespace CustomNavMesh
 
         public bool IsPaused => AgentIndex >= 0 && NavMeshJobManager.Instance != null && NavMeshJobManager.Instance.GetPaused(AgentIndex);
 
+        /// <summary>Leitura O(1) — não faz nenhuma consulta nova por trás, só reflete o triângulo já rastreado por frame. Útil pra checagens todo-frame (ex.: EnsureOnNavMesh) sem pagar o custo de um NavMesh.SamplePosition síncrono.</summary>
+        public bool IsOnNavMesh => AgentIndex >= 0 && NavMeshJobManager.Instance != null && NavMeshJobManager.Instance.GetIsOnNavMesh(AgentIndex);
+
         /// <summary>
         /// Reposiciona o agente instantaneamente (sem interpolar), tipo respawn ou pouso pós-
         /// movimento forçado. Descarta o corredor/destino atual — chame SetDestination de novo
@@ -186,6 +189,28 @@ namespace CustomNavMesh
         public void ClearAvoidanceOverride()
         {
             if (AgentIndex >= 0) NavMeshJobManager.Instance?.ClearAvoidanceOverride(AgentIndex);
+        }
+
+        /// <summary>
+        /// Substitui a busca ativa de corredor/flow field por uma velocidade explícita — pra
+        /// strafe, dodge, knockback e "andar pra frente" sem soltar o agente do sistema (continua
+        /// clampado na malha, ainda sofre avoidance dos vizinhos). Válido só neste frame, mesmo
+        /// contrato de SetAvoidanceOverride — chame de novo todo frame enquanto quiser mantê-lo.
+        /// Tem prioridade sobre Pause(): um agente pausado ainda se move se isto for chamado
+        /// (é assim que um ataque corpo-a-corpo consegue pausar o corredor e empurrar o
+        /// personagem pra frente no mesmo frame). Pula o clamp de MaxSpeed e a suavização de
+        /// aceleração (SteeringAccelerationFactor) — é pra ser instantâneo, sem rampa; ainda
+        /// assim não atravessa parede (ClampToNavMesh continua rodando incondicionalmente).
+        /// </summary>
+        public void SetVelocityOverride(Vector3 velocity)
+        {
+            if (AgentIndex >= 0) NavMeshJobManager.Instance?.SetVelocityOverride(AgentIndex, velocity);
+        }
+
+        /// <summary>Normalmente desnecessário — expira sozinho se você simplesmente parar de chamar SetVelocityOverride.</summary>
+        public void ClearVelocityOverride()
+        {
+            if (AgentIndex >= 0) NavMeshJobManager.Instance?.ClearVelocityOverride(AgentIndex);
         }
 
         internal bool HasDestination => hasDestination;

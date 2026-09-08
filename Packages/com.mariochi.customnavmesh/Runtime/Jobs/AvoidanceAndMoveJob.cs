@@ -125,6 +125,14 @@ namespace CustomNavMesh
         public float VerticalAvoidanceRange;
 
         /// <summary>
+        /// Margem de histerese (metros) que um triângulo vizinho precisa vencer por, em
+        /// distância, pra substituir o triângulo em cache no clamp de superfície
+        /// (ClampToNavMesh/TestTriangleAndNeighbors) — ver comentário no campo equivalente
+        /// do NavMeshJobManager (onde isso é exposto no inspector).
+        /// </summary>
+        public float TriangleStickyMargin;
+
+        /// <summary>
         /// Diagnóstico por agente pro frame atual (ver MovementFaultType) — 0/None é o caso
         /// normal. Escrito aqui, lido pelo NavMeshJobManager (main thread, pós-Complete) pra
         /// logar e mostrar no gizmo. Existe porque um travamento silencioso (NaN se propagando
@@ -416,7 +424,7 @@ namespace CustomNavMesh
 
             if (tri >= 0 && tri < NavTriangles.Length)
             {
-                int found = TestTriangleAndNeighbors(tri, newPos, out float3 cp, out float d2);
+                int found = TestTriangleAndNeighbors(tri, newPos, TriangleStickyMargin, out float3 cp, out float d2);
                 float threshold = NeighborQueryRadius * NeighborQueryRadius + 1f;
                 if (found >= 0 && d2 <= threshold)
                 {
@@ -442,37 +450,43 @@ namespace CustomNavMesh
             return safePos;
         }
 
-        int TestTriangleAndNeighbors(int tri, float3 p, out float3 closest, out float distSq)
+        /// <summary>
+        /// Testa o triângulo em cache + seus 3 vizinhos diretos e devolve o mais próximo de
+        /// 'p' — COM histerese: um vizinho só derruba o triângulo atual se vencer por mais de
+        /// 'stickyMargin' de distância (não apenas por estar marginalmente mais perto). Sem
+        /// essa margem, em trechos com triângulos pequenos e muito próximos entre si
+        /// (principalmente degraus de escada) o "vencedor" muda a cada frame só por ruído de
+        /// sub-milímetro na posição — cada troca reprojeta a posição clampada (sobretudo o Y)
+        /// discretamente, e como a direção do frame seguinte é calculada a partir dela, isso
+        /// aparece como zigue-zague bem localizado nas bordas dos degraus.
+        /// </summary>
+        int TestTriangleAndNeighbors(int tri, float3 p, float stickyMargin, out float3 closest, out float distSq)
         {
-            int best = -1;
-            float bestDistSq = float.MaxValue;
-            float3 bestPoint = p;
-
-            CheckOne(tri, p, ref best, ref bestDistSq, ref bestPoint);
+            int3 t0 = NavTriangles[tri];
+            float3 bestPoint = NavMeshQueryUtil.ClosestPointOnTriangle(p, NavVertices[t0.x], NavVertices[t0.y], NavVertices[t0.z]);
+            float bestDist = math.distance(bestPoint, p);
+            int best = tri;
 
             int3 nbs = NavNeighbors[tri];
             for (int e = 0; e < 3; e++)
             {
                 int nb = nbs[e];
-                if (nb >= 0) CheckOne(nb, p, ref best, ref bestDistSq, ref bestPoint);
+                if (nb < 0) continue;
+
+                int3 tn = NavTriangles[nb];
+                float3 cp = NavMeshQueryUtil.ClosestPointOnTriangle(p, NavVertices[tn.x], NavVertices[tn.y], NavVertices[tn.z]);
+                float d = math.distance(cp, p);
+                if (d + stickyMargin < bestDist)
+                {
+                    bestDist = d;
+                    best = nb;
+                    bestPoint = cp;
+                }
             }
 
             closest = bestPoint;
-            distSq = bestDistSq;
+            distSq = bestDist * bestDist;
             return best;
-        }
-
-        void CheckOne(int tri, float3 p, ref int best, ref float bestDistSq, ref float3 bestPoint)
-        {
-            int3 t = NavTriangles[tri];
-            float3 cp = NavMeshQueryUtil.ClosestPointOnTriangle(p, NavVertices[t.x], NavVertices[t.y], NavVertices[t.z]);
-            float d2 = math.distancesq(cp, p);
-            if (d2 < bestDistSq)
-            {
-                bestDistSq = d2;
-                best = tri;
-                bestPoint = cp;
-            }
         }
 
         public static int HashCellKey(int2 cell) => cell.x * 92821 + cell.y * 68917;

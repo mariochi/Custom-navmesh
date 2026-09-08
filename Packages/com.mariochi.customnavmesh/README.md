@@ -501,6 +501,26 @@ de calibração pra esse tamanho de mapa é o **broad-phase**, não o pathfindin
   visual: andar colado numa parede/desviando estranho logo após um repath, em vez de seguir
   o waypoint 0 do caminho recém-calculado). `NavMeshJobManager` agora zera o cursor no
   mesmo momento em que monta o `PathRequest`, antes de agendar o Job.
+- **Zigue-zague em degraus de escada.** `ClampToNavMesh` (o "onde estou na malha agora")
+  testa o triângulo em cache + seus 3 vizinhos e fica com o mais próximo — sem nenhuma
+  histerese, isso funciona bem em terreno normal (triângulos grandes, um vencedor óbvio),
+  mas em degraus (triângulos pequenos e muito próximos entre si, várias transições de
+  triângulo por metro) o "mais próximo" fica empatado entre o triângulo atual e um vizinho
+  a cada frame só por ruído de sub-milímetro na posição — cada troca reprojeta a posição
+  clampada (principalmente o Y) discretamente, e como a direção do frame seguinte é
+  calculada a partir dessa posição, isso vira zigue-zague visível concentrado exatamente
+  nas bordas dos degraus (a malha do funnel em si é imune a isso — `Funnel.TriArea2D`
+  projeta tudo em XZ, ignorando Y). Corrigido com `Triangle Sticky Margin` (no inspector
+  do `NavMeshJobManager`, default 0.02 = 2cm): um vizinho só substitui o triângulo atual
+  se vencer por mais que essa margem de distância, não só por estar marginalmente mais
+  perto — pequeno o bastante pra não atrapalhar uma transição real (que muda a posição por
+  bem mais que isso conforme o agente anda). Se o zigue-zague em escadas persistir, suba
+  um pouco esse valor; se agentes parecerem "grudar" um frame a mais que deveriam ao mudar
+  de triângulo em terreno normal, abaixe. **Dica relacionada**: se os agentes também
+  parecerem "pular" degraus ou tentar avançar vários de uma vez antes disso, verifique se
+  `Waypoint Reach Distance` não está maior que a profundidade do degrau (o funnel gera
+  cerca de 1 waypoint por degrau em escadas estreitas) — um valor grande demais dá o
+  waypoint do degrau seguinte como "alcançado" antes do agente realmente estar lá.
 - **Capacidade fixa.** `Agent Capacity` aloca os buffers uma vez no `Awake`. Registrar
   mais agentes que a capacidade loga um erro e o `CustomNavMeshAgent` fica desabilitado.
   Não há realloc dinâmico (de propósito, pra não ter que gerenciar containers em voo

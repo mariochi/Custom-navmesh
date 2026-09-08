@@ -48,6 +48,18 @@ namespace CustomNavMesh
             "garante índice de vértice compartilhado na costura entre tiles do NavMesh (comum em mapas " +
             "grandes) — sem soldar, cada tile vira uma ilha isolada e o A* nunca acha caminho entre eles.")]
         [SerializeField] float vertexWeldEpsilon = NavMeshGraphBuilder.DefaultWeldEpsilon;
+        [Tooltip("Margem de histerese (metros) que um triângulo vizinho precisa vencer POR, em " +
+            "distância, pra substituir o triângulo em cache no clamp de superfície de cada agente " +
+            "(ClampToNavMesh). Sem isso, em trechos com triângulos pequenos e muito próximos entre si " +
+            "— principalmente degraus de escada — o 'triângulo mais próximo' fica alternando entre dois " +
+            "candidatos quase empatados a cada frame só por ruído de sub-milímetro na posição; cada " +
+            "troca reprojeta a posição clampada (sobretudo o Y) discretamente, e como a direção do " +
+            "próximo frame é calculada a partir dessa posição, isso aparece como zigue-zague bem " +
+            "localizado nas bordas dos degraus. Valor pequeno o bastante pra não atrapalhar uma " +
+            "transição real entre triângulos (que muda a posição por muito mais que isso conforme o " +
+            "agente anda) — se o zigue-zague em escadas persistir, suba um pouco; se agentes parecerem " +
+            "'grudar' um frame a mais que deveriam ao mudar de triângulo, abaixe.")]
+        [SerializeField] float triangleStickyMargin = 0.02f;
         [Tooltip("Master switch pro mecanismo de NotifyNavMeshChanged(): se desligado, chamadas a " +
             "esse método são ignoradas (útil pra desligar tudo de uma vez em debug/profiling). Não " +
             "existe detecção automática de mudança no NavMesh — o jogo precisa chamar " +
@@ -1177,6 +1189,7 @@ namespace CustomNavMesh
                     SteeringAccelerationFactor = steeringAccelerationFactor,
                     CrowdPushDamping = crowdPushDamping,
                     VerticalAvoidanceRange = verticalAvoidanceRange,
+                    TriangleStickyMargin = triangleStickyMargin,
                     MovementFault = movementFault,
                     FlowFieldIgnoresAvoidance = flowFieldIgnoresAvoidance,
                     Paused = paused,

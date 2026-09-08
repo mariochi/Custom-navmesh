@@ -134,6 +134,116 @@ Mecânica interna, se for mexer/entender o código:
 - Avoidance entre agentes continua rodando normalmente por cima do flow field (mesmo
   `AvoidanceAndMoveJob`, só a fonte da velocidade preferida muda).
 
+## Controle de movimento por agente
+
+### Pause / Resume
+
+```csharp
+agent.Pause();   // trava a busca ativa do corredor/flow field — equivalente a NavMeshAgent.isStopped = true
+agent.Resume();  // retoma exatamente de onde parou
+bool paused = agent.IsPaused;
+```
+
+Diferente de `Stop()`: o corredor/flow field **não são descartados** (`Stop()` os zera). Um
+agente pausado continua participando do avoidance normalmente — outros agentes o veem
+como obstáculo, e ele reage se for empurrado (só a busca ativa por um alvo é que para).
+Uso típico: travar um bot durante uma animação de ataque corpo-a-corpo e retomar o mesmo
+destino depois, sem recalcular caminho.
+
+### Warp
+
+```csharp
+bool ok = agent.Warp(worldPosition); // reposiciona instantaneamente, sem interpolar
+```
+
+Pra respawn ou pouso pós-movimento-forçado. Acha o triângulo mais próximo, zera
+velocidade, descarta corredor/flow field/destino atual. `false` se o ponto está fora da
+área coberta pelo NavMesh (nada muda nesse caso). Chame `SetDestination` de novo depois
+se quiser que o agente continue andando pra algum lugar.
+
+### Avoidance por agente
+
+```csharp
+agent.IgnoreAvoidance = true; // permanente até trocar de novo — equivalente a "No Obstacle Avoidance"
+
+agent.SetAvoidanceOverride(neighborQueryRadius: 6f, timeHorizon: 3f); // válido só ESTE frame
+agent.ClearAvoidanceOverride(); // normalmente desnecessário — some sozinho se parar de chamar
+```
+
+- **`IgnoreAvoidance`**: o agente atravessa outros agentes sem desviar (mas outros ainda
+  desviam dele, já que a posição dele continua entrando no cálculo de avoidance dos
+  vizinhos). Bom pra unidades grandes/chefes que não devem ser bloqueados pela própria tropa.
+- **`SetAvoidanceOverride`**: sobrescreve `Neighbor Query Radius`/`Avoidance Time Horizon`
+  globais só pra esse agente, só pelo frame atual — chame de novo todo frame enquanto
+  quiser mantê-lo ativo (ex.: um trigger de zona chamando isso a cada `Update` enquanto o
+  agente estiver dentro dela). Pare de chamar e ele volta ao valor global sozinho, sem
+  precisar de `ClearAvoidanceOverride` explícito. **Atenção**: o raio de busca de vizinhos
+  usa uma janela fixa de células 3x3 (`Neighbor Cell Size`, global) — um override de raio
+  muito maior que ~1.5× `Neighbor Cell Size` não vai enxergar vizinhos além dessa janela;
+  se precisar de raios bem maiores, suba `Neighbor Cell Size` também.
+
+### Raio/altura/velocidade ao vivo
+
+`Radius`, `Height`, `MaxSpeed` e `WaypointReachDistance` agora propagam pro job
+imediatamente ao serem trocados em runtime (antes, só eram lidos uma vez no registro do
+agente — trocar `Radius` pra simular agachar, por exemplo, não tinha efeito nenhum no
+avoidance). Nada muda na API — continuam sendo as mesmas propriedades de sempre:
+
+```csharp
+agent.Radius = crouching ? 0.3f : 0.5f; // já reflete no avoidance a partir do próximo frame
+```
+
+### Progresso do caminho
+
+```csharp
+float remaining = agent.RemainingDistance; // soma dos segmentos entre o waypoint atual e o fim do corredor
+bool pending = agent.IsPathPending;        // true enquanto o pedido de repath está na fila (budget de Max Path Requests Per Frame)
+```
+
+`RemainingDistance` no modo flow field é uma aproximação (distância-ao-longo-do-campo até
+o triângulo de destino, não o caminho exato até o ponto de formação do agente) — exata só
+no modo corredor individual.
+
+## Rebuild automático quando o NavMesh muda
+
+Se o jogo faz carving em runtime (`NavMeshObstacle`, portões, barreiras mágicas, etc.), o
+`NavMeshJobManager` pode se manter sincronizado sozinho:
+
+- **`Auto Rebuild On NavMesh Change`** (default `true`): inscreve no
+  `UnityEngine.AI.NavMesh.onPreUpdate` (evento estático disparado sempre que o Unity
+  processa atualização de NavMesh, incluindo carving) e chama `RebuildGraph()` +
+  `RepathAllAgents()` automaticamente. Fecha o ciclo "portão fechou → malha recarva →
+  grafo do pacote atualiza → bots recalculam caminho" sem o jogo precisar saber que o
+  pacote existe.
+- **`Auto Rebuild Debounce`** (default 0.25s): várias mudanças em sequência rápida (vários
+  obstáculos entrando juntos) viram uma única reconstrução, não uma por frame.
+- Desligue o toggle se preferir chamar `RebuildGraph()` manualmente (ex.: só depois de uma
+  leva grande de mudanças, pra ter controle fino de quando o custo é pago).
+
+Se preferir/precisar de controle manual (ou o auto-rebuild estiver desligado), as duas
+peças continuam expostas separadamente:
+
+```csharp
+NavMeshJobManager.Instance.RebuildGraph();               // reconstrói o grafo a partir do NavMesh atual
+NavMeshJobManager.Instance.RepathAllAgents();             // força recálculo de quem tem destino ativo (modo corredor)
+NavMeshJobManager.Instance.RepathAgentsNear(point, 10f);  // versão barata: só quem está perto do que mudou
+```
+
+`RebuildGraph()` sozinho **não** força ninguém a recalcular — só invalida os índices de
+triângulo internos. Sem `RepathAllAgents()`/`RepathAgentsNear()` em seguida, um agente
+pode continuar seguindo um corredor calculado em cima da topologia antiga (ex.: atravessando
+um portão que acabou de fechar) até o handoff natural (chegar ao fim do corredor ou pedir
+um novo destino). `RepathAllAgents`/`RepathAgentsNear` ignoram agentes sem destino ativo
+(nada pra recalcular) e agentes em flow field (um `RebuildGraph()` já tira todo mundo do
+flow field automaticamente — se o grupo ainda precisa se mover, chame
+`MoveGroupWithFlowField` de novo).
+
+> **Nota de verificação**: `NavMesh.onPreUpdate` é a API pública que uso de memória pra
+> esse hook — não tive como compilar num Editor real pra confirmar contra a versão exata
+> do seu projeto. Se o símbolo não existir/tiver mudado de nome na sua versão do Unity, o
+> erro de compilação vai apontar exatamente essa linha em `NavMeshJobManager.OnEnable()`;
+> me avisa o nome certo que eu ajusto.
+
 ## Debug visual
 
 O `NavMeshJobManager` tem cinco toggles de Gizmo (Scene view, em Play mode):

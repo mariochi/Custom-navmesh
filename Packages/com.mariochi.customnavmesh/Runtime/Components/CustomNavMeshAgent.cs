@@ -24,11 +24,71 @@ namespace CustomNavMesh
             "visualmente na malha até a altura do pivot.")]
         [SerializeField] float height = 0f;
 
-        public float Radius { get => radius; set => radius = value; }
-        public float MaxSpeed { get => maxSpeed; set => maxSpeed = value; }
-        public float WaypointReachDistance { get => waypointReachDistance; set => waypointReachDistance = value; }
-        public uint AreaMask { get => areaMask; set => areaMask = value; }
-        public float Height { get => height; set => height = value; }
+        [Tooltip("Se marcado, este agente ignora avoidance por completo (equivalente a 'No Obstacle " +
+            "Avoidance' do NavMeshAgent padrão) — segue reto pro alvo, atravessando outros agentes. " +
+            "Útil pra unidades grandes/chefes que não devem ser desviados pela própria tropa.")]
+        [SerializeField] bool ignoreAvoidance = false;
+
+        // Radius/Height/MaxSpeed/WaypointReachDistance: o valor "fonte da verdade" depois do
+        // registro passa a ser o NativeArray do manager (o setter escreve lá direto); o campo
+        // serializado aqui só importa ANTES do registro (valor inicial) e se o componente for
+        // desabilitado/reabilitado (novo registro lê o campo de novo).
+        public float Radius
+        {
+            get => AgentIndex >= 0 && NavMeshJobManager.Instance != null ? NavMeshJobManager.Instance.GetRadius(AgentIndex) : radius;
+            set
+            {
+                radius = value;
+                if (AgentIndex >= 0) NavMeshJobManager.Instance?.SetRadius(AgentIndex, value);
+            }
+        }
+
+        public float MaxSpeed
+        {
+            get => AgentIndex >= 0 && NavMeshJobManager.Instance != null ? NavMeshJobManager.Instance.GetMaxSpeed(AgentIndex) : maxSpeed;
+            set
+            {
+                maxSpeed = value;
+                if (AgentIndex >= 0) NavMeshJobManager.Instance?.SetMaxSpeed(AgentIndex, value);
+            }
+        }
+
+        public float WaypointReachDistance
+        {
+            get => waypointReachDistance;
+            set
+            {
+                waypointReachDistance = value;
+                if (AgentIndex >= 0) NavMeshJobManager.Instance?.SetWaypointReachDistance(AgentIndex, value);
+            }
+        }
+
+        public float Height
+        {
+            get => height;
+            set
+            {
+                height = value;
+                if (AgentIndex >= 0) NavMeshJobManager.Instance?.SetHeight(AgentIndex, value);
+            }
+        }
+
+        public uint AreaMask { get => areaMask; set => areaMask = value; } // lido a cada repath (PathRequest), não cacheado — já é "vivo" por natureza
+
+        /// <summary>
+        /// Ignora avoidance por completo (equivalente a "No Obstacle Avoidance"). Ao contrário
+        /// de <see cref="SetAvoidanceOverride"/>, isso é permanente até você trocar de novo (não
+        /// expira sozinho a cada frame).
+        /// </summary>
+        public bool IgnoreAvoidance
+        {
+            get => AgentIndex >= 0 && NavMeshJobManager.Instance != null ? NavMeshJobManager.Instance.GetIgnoreAvoidance(AgentIndex) : ignoreAvoidance;
+            set
+            {
+                ignoreAvoidance = value;
+                if (AgentIndex >= 0) NavMeshJobManager.Instance?.SetIgnoreAvoidance(AgentIndex, value);
+            }
+        }
 
         internal int AgentIndex { get; set; } = -1;
         public PathStatus Status => AgentIndex >= 0 && NavMeshJobManager.Instance != null
@@ -66,12 +126,66 @@ namespace CustomNavMesh
             destinationDirty = true;
         }
 
-        /// <summary>Para o agente e limpa o corredor atual (ele fica parado onde está).</summary>
+        /// <summary>Para o agente e limpa o corredor atual (ele fica parado onde está, e esquece o destino — SetDestination de novo pra recomeçar).</summary>
         public void Stop()
         {
             hasDestination = false;
             destinationDirty = false;
             if (AgentIndex >= 0) NavMeshJobManager.Instance?.ClearCorridor(AgentIndex);
+        }
+
+        /// <summary>
+        /// Trava a busca ativa do corredor/flow field (equivalente a NavMeshAgent.isStopped =
+        /// true) SEM descartar o caminho — Resume() retoma exatamente de onde parou. Diferente
+        /// de Stop(): o destino/corredor continuam intactos. O agente ainda participa do
+        /// avoidance (outros o veem como obstáculo; ele reage se empurrado).
+        /// </summary>
+        public void Pause()
+        {
+            if (AgentIndex >= 0) NavMeshJobManager.Instance?.SetPaused(AgentIndex, true);
+        }
+
+        /// <summary>Retoma a busca do corredor/flow field depois de Pause().</summary>
+        public void Resume()
+        {
+            if (AgentIndex >= 0) NavMeshJobManager.Instance?.SetPaused(AgentIndex, false);
+        }
+
+        public bool IsPaused => AgentIndex >= 0 && NavMeshJobManager.Instance != null && NavMeshJobManager.Instance.GetPaused(AgentIndex);
+
+        /// <summary>
+        /// Reposiciona o agente instantaneamente (sem interpolar), tipo respawn ou pouso pós-
+        /// movimento forçado. Descarta o corredor/destino atual — chame SetDestination de novo
+        /// se quiser que ele continue andando pra algum lugar depois do warp.
+        /// </summary>
+        /// <returns>false se o ponto está fora da área coberta pelo NavMesh (nada muda nesse caso).</returns>
+        public bool Warp(Vector3 worldPosition)
+        {
+            if (AgentIndex < 0 || NavMeshJobManager.Instance == null) return false;
+
+            bool ok = NavMeshJobManager.Instance.Warp(AgentIndex, worldPosition);
+            if (ok)
+            {
+                hasDestination = false;
+                destinationDirty = false;
+            }
+            return ok;
+        }
+
+        /// <summary>
+        /// Override de avoidance válido só pelo frame atual — chame de novo todo frame enquanto
+        /// quiser mantê-lo ativo (ex.: enquanto o agente estiver dentro de uma zona de gargalo);
+        /// se parar de chamar, volta ao valor global do NavMeshJobManager sozinho no frame seguinte.
+        /// </summary>
+        public void SetAvoidanceOverride(float neighborQueryRadius, float timeHorizon)
+        {
+            if (AgentIndex >= 0) NavMeshJobManager.Instance?.SetAvoidanceOverride(AgentIndex, neighborQueryRadius, timeHorizon);
+        }
+
+        /// <summary>Remove o override antes do fim do frame (normalmente desnecessário — ele já expira sozinho se você simplesmente parar de chamar SetAvoidanceOverride).</summary>
+        public void ClearAvoidanceOverride()
+        {
+            if (AgentIndex >= 0) NavMeshJobManager.Instance?.ClearAvoidanceOverride(AgentIndex);
         }
 
         internal bool HasDestination => hasDestination;
@@ -96,5 +210,18 @@ namespace CustomNavMesh
         /// individual. Chamar SetDestination tira o agente do flow field no próximo frame.
         /// </summary>
         public bool IsUsingFlowField => Status == PathStatus.FlowField;
+
+        /// <summary>
+        /// Distância restante ao longo do corredor/flow field (soma dos segmentos entre o
+        /// waypoint atual e o fim) — não é linha reta até o destino. No modo flow field, é uma
+        /// aproximação (distância-ao-longo-do-campo até o triângulo de destino, não o caminho
+        /// exato até o ponto de formação). Infinito se o destino for inalcançável.
+        /// </summary>
+        public float RemainingDistance => AgentIndex >= 0 && NavMeshJobManager.Instance != null
+            ? NavMeshJobManager.Instance.GetRemainingDistance(AgentIndex) : 0f;
+
+        /// <summary>True enquanto um pedido de caminho individual (SetDestination) está na fila esperando processamento (respeitando Max Path Requests Per Frame) — ainda não vale nada em modo flow field.</summary>
+        public bool IsPathPending => AgentIndex >= 0 && NavMeshJobManager.Instance != null
+            && NavMeshJobManager.Instance.IsPathPending(AgentIndex);
     }
 }

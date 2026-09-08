@@ -1,8 +1,10 @@
+using System.Collections;
 using System.Collections.Generic;
 using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
+using UnityEngine.AI;
 using UnityEngine.Jobs;
 
 namespace CustomNavMesh
@@ -41,6 +43,16 @@ namespace CustomNavMesh
             "garante índice de vértice compartilhado na costura entre tiles do NavMesh (comum em mapas " +
             "grandes) — sem soldar, cada tile vira uma ilha isolada e o A* nunca acha caminho entre eles.")]
         [SerializeField] float vertexWeldEpsilon = NavMeshGraphBuilder.DefaultWeldEpsilon;
+        [Tooltip("Se marcado, o manager reconstrói o grafo sozinho (RebuildGraph + RepathAllAgents) " +
+            "sempre que o NavMesh mudar em runtime (NavMeshObstacle fazendo carving, NavMeshLink " +
+            "ativado/desativado, etc.) — inscrito em NavMesh.onPreUpdate. Várias mudanças próximas no " +
+            "tempo viram uma única reconstrução (ver Auto Rebuild Debounce). Desligue se preferir " +
+            "controlar manualmente quando chamar RebuildGraph().")]
+        [SerializeField] bool autoRebuildOnNavMeshChange = true;
+        [Tooltip("Janela de silêncio (segundos) depois da última mudança detectada no NavMesh antes " +
+            "de reconstruir o grafo — evita reconstruir uma vez por frame quando várias mudanças " +
+            "acontecem em sequência rápida (ex.: vários NavMeshObstacle entrando em cena juntos).")]
+        [SerializeField] float autoRebuildDebounce = 0.25f;
 
         [Header("Avoidance")]
         [SerializeField] float neighborCellSize = 2f;
@@ -118,6 +130,10 @@ namespace CustomNavMesh
         NativeArray<float3> corridorFlat;
         NativeArray<byte> movementFault; // MovementFaultType do frame atual, por agente — diagnóstico (ver AvoidanceAndMoveJob)
         NativeArray<bool> movementFaultLogged; // já logamos esse agente pelo menos uma vez (evita spam no Console)
+        NativeArray<bool> paused; // Pause()/Resume() — trava a busca ativa sem descartar corredor/flow field
+        NativeArray<bool> ignoreAvoidance; // por agente, permanente até trocar de novo
+        NativeArray<float> neighborRadiusOverride; // -1 = usa o global; resetado todo frame em LateUpdate (válido só 1 frame)
+        NativeArray<float> timeHorizonOverride; // -1 = usa o global; idem
 
         // --- flow field: por agente (capacidade fixa) + pool de campos achatado (depende de TriangleCount) ---
         NativeArray<int> flowFieldSlot; // -1 = agente no modo corredor
@@ -157,6 +173,50 @@ namespace CustomNavMesh
             AllocatePersistent();
         }
 
+        Coroutine autoRebuildCoroutine;
+        float autoRebuildDeadline;
+
+        void OnEnable()
+        {
+            // NavMesh.onPreUpdate dispara todo frame em que o Unity processa atualização de
+            // NavMesh — inclusive carving de NavMeshObstacle e NavMeshLink ligando/desligando.
+            // É a forma pública de saber "algo pode ter mudado" sem o jogo precisar chamar
+            // RebuildGraph() manualmente toda vez que mexe num obstáculo/portão.
+            NavMesh.onPreUpdate += HandleNavMeshPreUpdate;
+        }
+
+        void OnDisable()
+        {
+            NavMesh.onPreUpdate -= HandleNavMeshPreUpdate;
+        }
+
+        void HandleNavMeshPreUpdate()
+        {
+            if (!autoRebuildOnNavMeshChange) return;
+
+            // debounce: cada chamada empurra o prazo pra frente; a corrotina só executa o
+            // rebuild de fato depois de 'autoRebuildDebounce' segundos SEM nenhuma chamada nova
+            // — várias mudanças em sequência rápida (vários obstáculos entrando juntos) viram
+            // uma única reconstrução em vez de uma por frame.
+            autoRebuildDeadline = Time.time + autoRebuildDebounce;
+            if (autoRebuildCoroutine == null)
+                autoRebuildCoroutine = StartCoroutine(AutoRebuildDebounced());
+        }
+
+        IEnumerator AutoRebuildDebounced()
+        {
+            while (Time.time < autoRebuildDeadline)
+                yield return null;
+
+            autoRebuildCoroutine = null;
+
+            // fecha o ciclo completo: grafo novo (topologia atualizada) + força quem já tinha
+            // corredor calculado a recalcular em cima da malha nova (RebuildGraph sozinho não
+            // faz isso — só invalida os índices de triângulo, não repropõe destino a ninguém).
+            RebuildGraph();
+            RepathAllAgents();
+        }
+
         void Start()
         {
             // NÃO construir o grafo no Awake: com [DefaultExecutionOrder(-100)] o Awake deste
@@ -187,6 +247,10 @@ namespace CustomNavMesh
             corridorFlat = new NativeArray<float3>(capacity * NavMeshJobConstants.MaxCorridorPoints, Allocator.Persistent);
             movementFault = new NativeArray<byte>(capacity, Allocator.Persistent);
             movementFaultLogged = new NativeArray<bool>(capacity, Allocator.Persistent);
+            paused = new NativeArray<bool>(capacity, Allocator.Persistent);
+            ignoreAvoidance = new NativeArray<bool>(capacity, Allocator.Persistent);
+            neighborRadiusOverride = new NativeArray<float>(capacity, Allocator.Persistent);
+            timeHorizonOverride = new NativeArray<float>(capacity, Allocator.Persistent);
             flowFieldSlot = new NativeArray<int>(capacity, Allocator.Persistent);
             flowFieldPersonalTarget = new NativeArray<float3>(capacity, Allocator.Persistent);
 
@@ -194,6 +258,8 @@ namespace CustomNavMesh
             {
                 currentTriangle[i] = -1;
                 flowFieldSlot[i] = -1;
+                neighborRadiusOverride[i] = -1f;
+                timeHorizonOverride[i] = -1f;
             }
 
             int ffCapacity = math.max(1, maxFlowFields);
@@ -260,6 +326,50 @@ namespace CustomNavMesh
                 currentTriangle[i] = -1; // força nova busca de triângulo pros agentes já registrados
         }
 
+        /// <summary>
+        /// Força todo agente com destino ativo (modo corredor) a recalcular o caminho — chame
+        /// depois de RebuildGraph() se a topologia mudou (portão fechou, obstáculo apareceu) e o
+        /// corredor antigo pode ter virado inválido/subótimo sem que ninguém tenha detectado isso
+        /// sozinho. Agentes sem destino (nunca chamaram SetDestination) são ignorados — não tem
+        /// pra onde recalcular. Agentes em flow field também são ignorados aqui de propósito: um
+        /// RebuildGraph() já tira todo mundo do flow field automaticamente (volta pro modo
+        /// corredor); se o grupo ainda precisa se mover, chame MoveGroupWithFlowField de novo.
+        /// </summary>
+        public void RepathAllAgents()
+        {
+            for (int i = 0; i < count; i++)
+                RequestRepathIfPossible(i);
+        }
+
+        /// <summary>
+        /// Versão barata de RepathAllAgents: só recalcula quem está a até 'radius' unidades de
+        /// 'point' (posição atual do agente, não o destino) — útil quando você sabe exatamente
+        /// onde a malha mudou (ex.: um portão específico) e não quer pagar o custo de recalcular
+        /// o exército inteiro.
+        /// </summary>
+        public void RepathAgentsNear(Vector3 point, float radius)
+        {
+            float3 p = point;
+            float r2 = radius * radius;
+            for (int i = 0; i < count; i++)
+            {
+                if (math.distancesq(positions[i], p) <= r2)
+                    RequestRepathIfPossible(i);
+            }
+        }
+
+        void RequestRepathIfPossible(int i)
+        {
+            if (flowFieldSlot[i] >= 0) return; // flow field é responsabilidade de quem chamou MoveGroupWithFlowField, não mexe aqui
+
+            var agent = agentComponents[i];
+            if (agent == null || !agent.HasDestination) return; // nada pra recalcular
+
+            // reforça a MESMA flag suja que SetDestination usa — reaproveita CollectRepathRequests
+            // pra enfileirar o pedido, sem precisar de nenhum mecanismo novo.
+            agent.SetDestination((Vector3)agent.Destination);
+        }
+
         void OnDestroy()
         {
             frameHandle.Complete();
@@ -282,6 +392,10 @@ namespace CustomNavMesh
             if (corridorFlat.IsCreated) corridorFlat.Dispose();
             if (movementFault.IsCreated) movementFault.Dispose();
             if (movementFaultLogged.IsCreated) movementFaultLogged.Dispose();
+            if (paused.IsCreated) paused.Dispose();
+            if (ignoreAvoidance.IsCreated) ignoreAvoidance.Dispose();
+            if (neighborRadiusOverride.IsCreated) neighborRadiusOverride.Dispose();
+            if (timeHorizonOverride.IsCreated) timeHorizonOverride.Dispose();
             if (flowFieldSlot.IsCreated) flowFieldSlot.Dispose();
             if (flowFieldPersonalTarget.IsCreated) flowFieldPersonalTarget.Dispose();
             if (flowFieldDirections.IsCreated) flowFieldDirections.Dispose();
@@ -325,6 +439,10 @@ namespace CustomNavMesh
             currentTriangle[index] = -1;
             movementFault[index] = (byte)MovementFaultType.None;
             movementFaultLogged[index] = false; // slot pode ter sido usado por outro agente antes (swap-remove reaproveita índice)
+            paused[index] = false;
+            ignoreAvoidance[index] = agent.IgnoreAvoidance; // AgentIndex do 'agent' ainda é -1 aqui, então o getter lê o campo serializado local
+            neighborRadiusOverride[index] = -1f;
+            timeHorizonOverride[index] = -1f;
             flowFieldSlot[index] = -1;
 
             transformAccessArray.Add(agent.transform);
@@ -365,6 +483,10 @@ namespace CustomNavMesh
                 currentTriangle[index] = currentTriangle[last];
                 movementFault[index] = movementFault[last];
                 movementFaultLogged[index] = movementFaultLogged[last];
+                paused[index] = paused[last];
+                ignoreAvoidance[index] = ignoreAvoidance[last];
+                neighborRadiusOverride[index] = neighborRadiusOverride[last];
+                timeHorizonOverride[index] = timeHorizonOverride[last];
                 flowFieldSlot[index] = flowFieldSlot[last]; // RefCount do slot não muda — o agente que ocupava 'last' continua usando o mesmo slot, só migrou de índice
                 flowFieldPersonalTarget[index] = flowFieldPersonalTarget[last];
 
@@ -396,6 +518,115 @@ namespace CustomNavMesh
 
             ReleaseFlowFieldRef(flowFieldSlot[index]);
             flowFieldSlot[index] = -1;
+        }
+
+        // ==================== pause / warp / avoidance override / tuning ao vivo ====================
+
+        public void SetPaused(int index, bool value)
+        {
+            if (index >= 0 && index < count) paused[index] = value;
+        }
+
+        public bool GetPaused(int index) => index >= 0 && index < count && paused[index];
+
+        /// <summary>
+        /// Reposiciona o agente instantaneamente. Acha o triângulo mais próximo, zera
+        /// velocidade, limpa corredor/flow field. Não mexe no destino do CustomNavMeshAgent
+        /// (quem chama — CustomNavMeshAgent.Warp — decide se limpa isso também).
+        /// </summary>
+        /// <returns>false se o ponto está fora da área coberta pelo NavMesh, ou o grafo não está pronto.</returns>
+        public bool Warp(int index, Vector3 worldPosition)
+        {
+            if (index < 0 || index >= count || !graphReady) return false;
+
+            frameHandle.Complete(); // seguro mexer nos arrays sem job em voo
+
+            int tri = NavMeshQueryUtil.FindNearestTriangle(worldPosition, triGrid, graph.Vertices, graph.Triangles, out float3 clamped);
+            if (tri < 0) return false;
+
+            positions[index] = clamped;
+            outPositions[index] = clamped;
+            velocities[index] = float3.zero;
+            prevVelocities[index] = float3.zero;
+            currentTriangle[index] = tri;
+
+            corridorLength[index] = 0;
+            corridorCursor[index] = 0;
+            pathStatus[index] = (byte)PathStatus.None;
+
+            ReleaseFlowFieldRef(flowFieldSlot[index]);
+            flowFieldSlot[index] = -1;
+
+            var t = agentComponents[index].transform;
+            t.position = clamped + new float3(0f, heights[index], 0f);
+
+            return true;
+        }
+
+        public void SetIgnoreAvoidance(int index, bool value)
+        {
+            if (index >= 0 && index < count) ignoreAvoidance[index] = value;
+        }
+
+        public bool GetIgnoreAvoidance(int index) => index >= 0 && index < count && ignoreAvoidance[index];
+
+        /// <summary>Válido só até o próximo LateUpdate resetar (ver comentário lá) — chame de novo todo frame pra manter.</summary>
+        public void SetAvoidanceOverride(int index, float neighborQueryRadius, float timeHorizon)
+        {
+            if (index < 0 || index >= count) return;
+            neighborRadiusOverride[index] = neighborQueryRadius;
+            timeHorizonOverride[index] = timeHorizon;
+        }
+
+        public void ClearAvoidanceOverride(int index)
+        {
+            if (index < 0 || index >= count) return;
+            neighborRadiusOverride[index] = -1f;
+            timeHorizonOverride[index] = -1f;
+        }
+
+        public float GetRadius(int index) => index >= 0 && index < count ? radii[index] : 0f;
+        public void SetRadius(int index, float value) { if (index >= 0 && index < count) radii[index] = value; }
+
+        public float GetMaxSpeed(int index) => index >= 0 && index < count ? maxSpeeds[index] : 0f;
+        public void SetMaxSpeed(int index, float value) { if (index >= 0 && index < count) maxSpeeds[index] = value; }
+
+        public void SetHeight(int index, float value) { if (index >= 0 && index < count) heights[index] = value; }
+
+        public void SetWaypointReachDistance(int index, float value) { if (index >= 0 && index < count) waypointReachDistances[index] = value; }
+
+        /// <summary>True enquanto o pedido de repath individual de 'index' está na fila (ainda não processado por causa do budget de Max Path Requests Per Frame).</summary>
+        public bool IsPathPending(int index) => pendingRepathSet.Contains(index);
+
+        /// <summary>
+        /// Distância restante estimada. Modo corredor: soma exata dos segmentos entre o waypoint
+        /// atual e o fim. Modo flow field: aproximação (distância-ao-longo-do-campo até o
+        /// triângulo de destino — não é a distância exata até o ponto de formação do agente).
+        /// Infinito se o triângulo atual não tiver referência válida ou o alvo for inalcançável.
+        /// </summary>
+        public float GetRemainingDistance(int index)
+        {
+            if (index < 0 || index >= count) return 0f;
+
+            int slot = flowFieldSlot[index];
+            if (slot >= 0)
+            {
+                int tri = currentTriangle[index];
+                if (tri < 0) return float.PositiveInfinity;
+
+                float d = flowFieldDistance[slot * graph.TriangleCount + tri];
+                return d >= float.MaxValue ? float.PositiveInfinity : d;
+            }
+
+            int len = corridorLength[index];
+            if (len <= 0) return 0f;
+
+            int cursor = corridorCursor[index];
+            int baseIdx = index * NavMeshJobConstants.MaxCorridorPoints;
+            float total = math.distance(positions[index], corridorFlat[baseIdx + cursor]);
+            for (int p = cursor; p < len - 1; p++)
+                total += math.distance(corridorFlat[baseIdx + p], corridorFlat[baseIdx + p + 1]);
+            return total;
         }
 
         // ==================== flow field (grupo) ====================
@@ -661,6 +892,24 @@ namespace CustomNavMesh
             }
 
             LogMovementFaults();
+            ExpireAvoidanceOverrides();
+        }
+
+        /// <summary>
+        /// SetAvoidanceOverride é "válido só neste frame" por design: o job deste frame já
+        /// consumiu os valores atuais (Update -> ScheduleFrameJobs, antes de qualquer script de
+        /// gameplay de execution order default rodar), então é seguro resetar pra -1 aqui — quem
+        /// quiser manter o override simplesmente chama SetAvoidanceOverride nele nesse mesmo
+        /// frame, definindo o valor que vale pro PRÓXIMO frame (mesmo atraso de 1 frame que já
+        /// existe em Positions/PrevVelocities).
+        /// </summary>
+        void ExpireAvoidanceOverrides()
+        {
+            for (int i = 0; i < count; i++)
+            {
+                neighborRadiusOverride[i] = -1f;
+                timeHorizonOverride[i] = -1f;
+            }
         }
 
         /// <summary>
@@ -842,6 +1091,10 @@ namespace CustomNavMesh
                     CrowdPushDamping = crowdPushDamping,
                     MovementFault = movementFault,
                     FlowFieldIgnoresAvoidance = flowFieldIgnoresAvoidance,
+                    Paused = paused,
+                    IgnoreAvoidance = ignoreAvoidance,
+                    NeighborRadiusOverride = neighborRadiusOverride,
+                    TimeHorizonOverride = timeHorizonOverride,
                 }.Schedule(transformAccessArray, deps);
             }
 

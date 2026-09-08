@@ -126,15 +126,31 @@ namespace CustomNavMesh
         /// </summary>
         public NativeArray<byte> MovementFault;
 
+        /// <summary>Agente pausado: não busca ativamente o corredor/flow field (prefVel=0), mas continua recebendo/aplicando avoidance — outros agentes o veem como obstáculo e ele reage se empurrado. Corredor/cursor/flow field ficam intocados.</summary>
+        [ReadOnly] public NativeArray<bool> Paused;
+
+        /// <summary>Agente ignora avoidance por completo (equivalente a "no obstacle avoidance") — segue reto pro alvo, atravessando outros agentes.</summary>
+        [ReadOnly] public NativeArray<bool> IgnoreAvoidance;
+
+        /// <summary>Override por agente de NeighborQueryRadius; -1 = usa o valor global. "Válido só neste frame" é responsabilidade de quem chama NavMeshJobManager.SetAvoidanceOverride (o manager rereseta pra -1 todo frame).</summary>
+        [ReadOnly] public NativeArray<float> NeighborRadiusOverride;
+
+        /// <summary>Override por agente de TimeHorizon; -1 = usa o valor global.</summary>
+        [ReadOnly] public NativeArray<float> TimeHorizonOverride;
+
         public void Execute(int index, TransformAccess transform)
         {
             MovementFault[index] = (byte)MovementFaultType.None;
             float3 pos = Positions[index];
             int ffSlot = FlowFieldSlot[index];
 
-            float3 prefVel = ffSlot >= 0
-                ? ComputeFlowFieldPrefVel(index, ffSlot, pos)
-                : ComputeCorridorPrefVel(index, pos);
+            // pausado: não avança corredor/flow field (não chama Compute*PrefVel — CorridorCursor
+            // e afins ficam exatamente como estavam), só zera a velocidade de busca. O avoidance
+            // roda igual logo abaixo, então o agente ainda reage se for empurrado.
+            bool isPaused = Paused[index];
+            float3 prefVel = isPaused
+                ? float3.zero
+                : (ffSlot >= 0 ? ComputeFlowFieldPrefVel(index, ffSlot, pos) : ComputeCorridorPrefVel(index, pos));
 
             // Acumula a contribuição de CADA vizinho contra a MESMA velocidade preferida fixa
             // (não uma 'vel' sendo mutada a cada vizinho processado) e tira a média no final —
@@ -149,10 +165,21 @@ namespace CustomNavMesh
 
             // teste diagnóstico: agente em flow field pode pular o avoidance inteiro, pra isolar
             // se um zigue-zague residual vem daqui ou de outro lugar (pode se sobrepor com isso ligado).
-            bool skipAvoidance = ffSlot >= 0 && FlowFieldIgnoresAvoidance;
+            // IgnoreAvoidance é o equivalente "de produção" disso, por agente (ex.: chefes que
+            // atravessam a própria tropa) — mesmo mecanismo, motivo diferente.
+            bool skipAvoidance = (ffSlot >= 0 && FlowFieldIgnoresAvoidance) || IgnoreAvoidance[index];
 
             if (!skipAvoidance)
             {
+                // resolve o raio/horizonte efetivos pra ESTE agente: override por agente (setado via
+                // NavMeshJobManager.SetAvoidanceOverride, ex.: perto de um gargalo) ou o valor global.
+                // Atenção: o raio de busca de vizinhos é limitado pela janela fixa 3x3 de células
+                // (NeighborCellSize, global) — um override de raio muito maior que ~1.5x
+                // NeighborCellSize não vai enxergar vizinhos além dessa janela; se precisar de raios
+                // bem maiores, suba NeighborCellSize também.
+                float effectiveRadius = NeighborRadiusOverride[index] >= 0f ? NeighborRadiusOverride[index] : NeighborQueryRadius;
+                float effectiveTimeHorizon = TimeHorizonOverride[index] >= 0f ? TimeHorizonOverride[index] : TimeHorizon;
+
                 int2 selfCell = (int2)math.floor(pos.xz / NeighborCellSize);
                 for (int dx = -1; dx <= 1; dx++)
                 {
@@ -165,7 +192,7 @@ namespace CustomNavMesh
                             {
                                 if (other == index) continue;
                                 ApplyAvoidance(index, other, pos, prefVel, in Positions, in PrevVelocities, in Radii, in MaxSpeeds,
-                                    NeighborQueryRadius, TimeHorizon, CrowdPushDamping, ref avoidanceSum, ref neighborCount);
+                                    effectiveRadius, effectiveTimeHorizon, CrowdPushDamping, ref avoidanceSum, ref neighborCount);
                             }
                             while (SpatialHash.TryGetNextValue(out other, ref it));
                         }

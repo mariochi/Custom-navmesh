@@ -483,6 +483,21 @@ de calibração pra esse tamanho de mapa é o **broad-phase**, não o pathfindin
   poucos/nenhum vértice soldado e `NoPath` persistir só nas fronteiras de tile, aumente
   `Vertex Weld Epsilon` (a costura pode ter uma folga maior que o default, dependendo do
   `Voxel Size` do bake).
+- ~~**Solda de vértice falhava de forma imprevisível em fronteira de célula de
+  quantização.**~~ Resolvido — `WeldVertices` usava a célula de quantização
+  (`arredondar(posição / epsilon)`) como chave de hash direta, sem checar as células
+  vizinhas. Dois vértices genuinamente a MENOS de `Vertex Weld Epsilon` um do outro podiam
+  cair em células diferentes se estivessem em lados opostos de uma fronteira (ex.: epsilon
+  0.01, vértices em x=0.0049 e x=0.0051 — diferença real de 0.0002, mas arredondam pra
+  células adjacentes) — a solda falhava sem nenhum padrão previsível, dependendo da posição
+  sub-milimétrica exata de cada par. Isso não era exclusivo de costura de tile: qualquer
+  junção entre pedaços de malha diferentes (o canto onde múltiplas peças de parede se
+  encontram, por exemplo) podia sofrer do mesmo jeito, produzindo `PathStatus.NoPath` num
+  ponto específico do mapa mesmo com `Vertex Weld Epsilon` "grande o suficiente" e outras
+  costuras próximas soldando normalmente. Agora `WeldVertices` também checa as 26 células
+  vizinhas (janela 3x3x3) antes de decidir que um vértice é novo, com uma checagem de
+  distância real (não só a célula) antes de fundir — elimina esse falso-negativo
+  independente de onde a coincidência cai em relação à grade.
 
 ## Limitações conhecidas / pontos de atenção
 

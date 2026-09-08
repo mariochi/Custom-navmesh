@@ -1,6 +1,6 @@
 {
   "name": "com.mariochi.customnavmesh",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "displayName": "Custom NavMesh (Job System)",
   "description": "Sistema de agentes de navegação multithreaded via Unity Job System + Burst, lendo a triangulação gerada pelo bake padrão do NavMesh do Unity (NavMesh.CalculateTriangulation). Inclui pathfinding individual (A* + funnel/string-pulling), avoidance local entre agentes e flow fields para movimento de grupo com manutenção de formação. Não substitui o bake do NavMesh (continue usando Window > AI > Navigation ou um NavMeshSurface do com.unity.ai.navigation) — este pacote só lê a malha já pronta e resolve as consultas fora da main thread.",
   "unity": "2021.3",

@@ -51,6 +51,56 @@ resolvidas automaticamente pelo Package Manager a partir do `package.json`.
    depois de gerar terreno procedural), chame `NavMeshJobManager.Instance.RebuildGraph()`
    em seguida.
 
+## Quando é seguro chamar a API (contrato de thread-safety)
+
+**Leia isto antes de integrar `CustomNavMeshAgent`/`NavMeshJobManager` em código de
+gameplay.** É uma restrição rígida do design, não uma sugestão de estilo — desrespeitar
+resultou num crash real de thread-safety do Job System numa revisão do pacote já instalado
+no jogo (`NavMeshMovement.Update()` lendo/escrevendo a API com o Job em voo).
+
+Por baixo dos panos, `NavMeshJobManager` (`[DefaultExecutionOrder(-100)]`, sempre roda
+antes dos scripts com ordem padrão) faz `Schedule()` **e** `Complete()` do Job do frame
+dentro da **mesma chamada** do próprio `LateUpdate()` — depois que **todo** `Update()` da
+cena já rodou. Isso significa que os `NativeArray`s por trás da API (`Velocity`,
+`IsOnNavMesh`, `Status`, `SetVelocityOverride`, `SetAvoidanceOverride`, `Radius`/`Height`/
+`MaxSpeed`, `SetDestination`, `Warp`, `Pause`/`Resume` etc.) nunca estão com um Job em voo
+durante o `Update()` de nenhum script — é a única janela do frame com essa garantia.
+
+**Regra prática: chame a API do `CustomNavMeshAgent`/`NavMeshJobManager` de dentro de
+`Update()` (de qualquer script, ordem de execução padrão ou não — a do manager sempre
+executa primeiro). Nunca de `LateUpdate()` nem de `FixedUpdate()`.**
+
+- `LateUpdate()` de outro script: já não trava mais o Editor com Safety Checks (o
+  `Schedule`/`Complete` do manager está isolado dentro do `LateUpdate()` dele, que sempre
+  roda primeiro), mas o `ScheduleFrameJobs()` deste frame **já rodou** antes do seu
+  `LateUpdate()` ser chamado — então `SetDestination`/`Warp`/`Pause` chamados ali só
+  entram em vigor no Job do **próximo** frame (atraso de 1 frame, silencioso).
+- `FixedUpdate()`: roda **antes** do `Update()` do manager nesse mesmo frame, então
+  qualquer coisa setada ali é apagada pelo `ExpirePerFrameOverrides()` do próprio
+  `Update()` do manager (ver abaixo) antes de qualquer Job ler — na prática, o mesmo
+  problema de overrides "erased before consumption" que motivou este redesenho todo.
+- `Awake()`/`Start()`/corrotinas: seguros pra chamadas que não expiram por frame
+  (`SetDestination`, `Warp`, `Pause/Resume`, `SetRadius/SetMaxSpeed/SetHeight`,
+  `MoveGroupWithFlowField`, `RepathAllAgents`, `NotifyNavMeshChanged` — o pior caso é um
+  atraso de até 1 frame se caírem antes do primeiro `LateUpdate()` agendar). **Não** são
+  seguros pra `SetVelocityOverride`/`SetAvoidanceOverride` — ver próximo bullet.
+
+**Caso especial: `SetVelocityOverride`/`SetAvoidanceOverride`.** Esses dois são "válidos
+só neste frame" por design — o manager zera os dois logo no início do **seu próprio**
+`Update()` (`ExpirePerFrameOverrides()`, antes de qualquer script de gameplay rodar o
+`Update()` dele nesse frame), justamente pra permitir que você chame de novo todo frame
+sem precisar de `Clear...` explícito. Consequência: só chamar de dentro de `Update()`
+garante que o valor sobreviva até o `LateUpdate()` do mesmo frame agendar o Job. Chamado
+de `Awake()`/`Start()`/`FixedUpdate()`, o valor é apagado pelo próprio
+`ExpirePerFrameOverrides()` antes de qualquer Job existir pra lê-lo — nunca surte efeito.
+Chamado de `LateUpdate()`, o Job deste frame já foi agendado sem ele, e ele é apagado no
+próximo `Update()` antes do Job seguinte rodar — também nunca surte efeito. `Update()` é
+literalmente a única janela em que esses dois funcionam.
+
+Resumindo numa frase: **se é `Update()`, está seguro e some no máximo em 0 frames de
+atraso; qualquer outra fase, ou funciona com atraso de 1 frame (chamadas normais) ou nunca
+funciona (overrides por frame).**
+
 ## Flow field (movimento de grupo)
 
 Pra grupos grandes de agentes convergindo pro **mesmo destino** (comando de RTS: seleciona
@@ -67,8 +117,11 @@ NavMeshJobManager.Instance.MoveGroupWithFlowField(selectedAgents, targetPosition
 
 - `agents`: array de `CustomNavMeshAgent` (precisam já estar registrados, ou seja,
   `enabled` e com `AgentIndex` válido — normal se já estão na cena).
-- `destination`: ponto no mundo; se cair fora da área coberta pelo NavMesh, a chamada
-  loga um aviso e não faz nada (retorna `false`).
+- `destination`: ponto no mundo; se cair fora da área coberta pelo NavMesh, **ou** cair
+  numa área que `areaMask` não permite, a chamada loga um aviso e não faz nada (retorna
+  `false`) — antes só a primeira checagem existia, um destino tecnicamente sobre o NavMesh
+  mas numa área bloqueada (ex.: "água" fora de `areaMask`) passava batido e o Dijkstra
+  rodava a partir de um triângulo que ele mesmo trataria como inacessível.
 - `areaMask` (opcional): igual ao `AreaMask` do `CustomNavMeshAgent`, filtra quais áreas
   do NavMesh o campo pode atravessar.
 - `keepFormation` (opcional, default `true`): em vez de todo mundo mirar o mesmo ponto
@@ -181,6 +234,13 @@ agent.ClearAvoidanceOverride(); // normalmente desnecessário — some sozinho s
   usa uma janela fixa de células 3x3 (`Neighbor Cell Size`, global) — um override de raio
   muito maior que ~1.5× `Neighbor Cell Size` não vai enxergar vizinhos além dessa janela;
   se precisar de raios bem maiores, suba `Neighbor Cell Size` também.
+- **`Vertical Avoidance Range`** (global, no inspector do `NavMeshJobManager`, default 2):
+  diferença de altura (Y) acima da qual dois agentes deixam de se enxergar pra avoidance,
+  mesmo próximos em XZ. Sem isso, um agente em cima de uma muralha/ponte e outro embaixo
+  dela se desviavam um do outro como se estivessem no mesmo plano (todo o cálculo de
+  avoidance era feito só em XZ). Ajuste pra cobrir a altura típica de um agente — cobre
+  demais e volta a juntar andares/pontes diferentes; cobre de menos e ignora vizinhos numa
+  rampa suave que deveriam se enxergar. Não é por agente (ainda) — é um único valor global.
 
 ### Velocidade explícita (strafe / dodge / knockback / step)
 
@@ -358,18 +418,25 @@ AvoidanceAndMoveJob (IJobParallelForTransform) — avoidance local + integra pos
                                             (por agente: segue corredor OU flow field, nunca os dois)
 ```
 
-Pipeline por frame (`NavMeshJobManager`):
+Pipeline por frame (`NavMeshJobManager`, ver também "Quando é seguro chamar a API" acima):
 
-- **`Update()`**: completa o `JobHandle` do frame anterior (deveria já estar pronto, é
-  só uma garantia), coleta os agentes que pediram um novo destino desde o último frame
-  (respeitando `Max Path Requests Per Frame`, pra não gerar picos de custo quando muitos
-  agentes pedem caminho ao mesmo tempo) e agenda os Jobs do frame.
-- **`LateUpdate()`**: dá `Complete()` no `JobHandle` — ponto de sincronização, garantindo
-  que posição/velocidade estejam prontas antes de física/câmera/animação lerem o
-  Transform. Entre o `Schedule` (Update) e o `Complete` (LateUpdate), os Jobs rodam em
-  paralelo nos worker threads enquanto o resto do `Update` de outros scripts acontece na
-  main thread — é esse overlap (mais o fato de todos os agentes serem resolvidos em
-  paralelo entre si) que dá o ganho sobre o sistema padrão do Unity.
+- **`Update()`**: completa o `JobHandle` agendado no `LateUpdate()` anterior (deveria já
+  estar pronto — é só uma garantia idempotente), copia posição/velocidade resolvidas pro
+  array que a API lê, loga faults, expira os overrides por frame
+  (`ExpirePerFrameOverrides`), checa chegadas de flow field e coleta os agentes que
+  pediram um novo destino desde o último frame (respeitando `Max Path Requests Per
+  Frame`). **Não agenda o Job aqui** — só depois que todo `Update()` da cena rodou.
+- **`LateUpdate()`**: agenda **e** completa o `JobHandle` do frame na mesma chamada
+  (`ScheduleFrameJobs()` + `Complete()`). Como `NavMeshJobManager` tem
+  `[DefaultExecutionOrder(-100)]`, esse `LateUpdate()` roda antes do de qualquer outro
+  script — ou seja, o Schedule/Complete inteiro acontece isolado, sem nenhum código de
+  gameplay rodando no meio. É essa janela (não mais overlap entre Schedule e Complete)
+  que garante que ler/escrever a API em `Update()` de qualquer script nunca colide com um
+  Job em voo — trade-off deliberado: abrimos mão do overlap "Job rodando enquanto o resto
+  do frame roda" (ganho secundário) pra eliminar uma violação real de thread-safety do Job
+  System encontrada em revisão (script de gameplay lendo/escrevendo com o Job já agendado
+  e ainda não completado). O ganho principal — resolver todos os agentes em paralelo
+  entre si nos worker threads — continua intacto.
 
 Cada agente é uma linha "densa" (índice compacto, sem buracos) nos NativeArrays do
 manager, espelhando um `TransformAccessArray`. Remover um agente faz swap-back do
@@ -419,6 +486,21 @@ de calibração pra esse tamanho de mapa é o **broad-phase**, não o pathfindin
 
 ## Limitações conhecidas / pontos de atenção
 
+- ~~**AreaMask não validado no atalho de mesmo triângulo.**~~ Resolvido — quando início e
+  fim de um `SetDestination` caíam no mesmo triângulo, `FindPathsBatchJob` retornava
+  `Success` direto (atalho antes de qualquer expansão do A*), sem passar pelo
+  `IsAreaAllowed` que os vizinhos expandidos já checavam normalmente. Um destino técnica-
+  mente alcançável mas numa área bloqueada por `AreaMask` (ex.: "água") era aceito como se
+  fosse válido. Agora o atalho valida a área de `startTri`/`endTri` antes de aceitar (ver
+  [FindPathsBatchJob.cs](Runtime/Jobs/FindPathsBatchJob.cs)); o mesmo buraco existia (e foi
+  fechado) pro alvo de `MoveGroupWithFlowField` (ver seção "Flow field" acima).
+- ~~**`CorridorCursor` não resetava num repath.**~~ Resolvido — pedir um novo
+  `SetDestination` gerava um corredor novo, mas o índice de progresso (`CorridorCursor`)
+  do agente continuava de onde tinha parado no corredor ANTERIOR. Corredores mais curtos
+  que o cursor herdado faziam o agente mirar um índice fora do corredor novo (efeito
+  visual: andar colado numa parede/desviando estranho logo após um repath, em vez de seguir
+  o waypoint 0 do caminho recém-calculado). `NavMeshJobManager` agora zera o cursor no
+  mesmo momento em que monta o `PathRequest`, antes de agendar o Job.
 - **Capacidade fixa.** `Agent Capacity` aloca os buffers uma vez no `Awake`. Registrar
   mais agentes que a capacidade loga um erro e o `CustomNavMeshAgent` fica desabilitado.
   Não há realloc dinâmico (de propósito, pra não ter que gerenciar containers em voo
@@ -461,13 +543,14 @@ de calibração pra esse tamanho de mapa é o **broad-phase**, não o pathfindin
 - ~~**Sem `asmdef` próprio.**~~ Resolvido — o código virou um pacote UPM embutido
   (`Packages/com.mariochi.customnavmesh`) com `CustomNavMesh.Runtime.asmdef` próprio,
   isolado do `Assembly-CSharp` do projeto host.
-- **Não testado dentro de uma sessão do Editor** (este ambiente não tinha o Unity Editor
-  disponível pra compilar/rodar). O código foi escrito com cuidado contra a API do
-  Job System/Burst/Collections/Mathematics da versão do projeto (Unity 6000.3.19f1,
-  `com.unity.collections`/`com.unity.burst`/`com.unity.mathematics` já presentes como
-  dependências transitivas — confirmado pelos `.csproj` do projeto), mas abra no Editor
-  e rode o Console antes de confiar de olhos fechados; qualquer erro de compilação, me
-  manda a mensagem que eu conserto.
+- **Não testado dentro de uma sessão do Editor por mim** (este ambiente não tem o Unity
+  Editor disponível pra compilar/rodar) — toda a validação de correção depende de análise
+  estática cuidadosa mais o teste real que vocês fazem no Editor. `package.json` declara
+  `"unity": "2021.3"` como piso (baixado de `6000.3`, que era otimista demais pro projeto
+  real, que roda **Unity 2022.3.62f2**) — as APIs de Job System/Burst/Collections/
+  Mathematics usadas aqui são estáveis desde bem antes disso, mas esse piso ainda não foi
+  confirmado compilando de verdade numa 2021.3; se notar qualquer erro de compilação
+  específico de versão, me manda a mensagem que eu ajusto o piso declarado ou o código.
 
 ## Arquivos
 

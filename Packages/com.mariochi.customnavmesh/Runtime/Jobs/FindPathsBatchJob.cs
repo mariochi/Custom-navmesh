@@ -55,6 +55,18 @@ namespace CustomNavMesh
                 return;
             }
 
+            // valida a máscara de área ANTES do atalho "mesmo triângulo" — sem isso, um
+            // start/end que caem no mesmo triângulo retornava Success mesmo se aquele
+            // triângulo estivesse fora de AreaMask (o atalho nunca passava pelo
+            // IsAreaAllowed que a expansão do A* abaixo já checa nos vizinhos).
+            if (!NavMeshQueryUtil.IsAreaAllowed(TriangleArea[startTri], req.AreaMask) ||
+                !NavMeshQueryUtil.IsAreaAllowed(TriangleArea[endTri], req.AreaMask))
+            {
+                StatusOut[req.AgentIndex] = (byte)PathStatus.Invalid;
+                CorridorLengthOut[req.AgentIndex] = 0;
+                return;
+            }
+
             if (startTri == endTri)
             {
                 CorridorOut[outBase + 0] = startPoint;

@@ -118,6 +118,13 @@ namespace CustomNavMesh
         public float CrowdPushDamping;
 
         /// <summary>
+        /// Diferença de altura (Y) acima da qual dois agentes não se enxergam pra avoidance,
+        /// mesmo estando próximos em XZ — sem isso, um agente em cima de uma muralha/ponte e
+        /// outro embaixo dela se desviam um do outro como se estivessem no mesmo plano.
+        /// </summary>
+        public float VerticalAvoidanceRange;
+
+        /// <summary>
         /// Diagnóstico por agente pro frame atual (ver MovementFaultType) — 0/None é o caso
         /// normal. Escrito aqui, lido pelo NavMeshJobManager (main thread, pós-Complete) pra
         /// logar e mostrar no gizmo. Existe porque um travamento silencioso (NaN se propagando
@@ -202,7 +209,7 @@ namespace CustomNavMesh
                             {
                                 if (other == index) continue;
                                 ApplyAvoidance(index, other, pos, prefVel, in Positions, in PrevVelocities, in Radii, in MaxSpeeds,
-                                    effectiveRadius, effectiveTimeHorizon, CrowdPushDamping, ref avoidanceSum, ref neighborCount);
+                                    effectiveRadius, effectiveTimeHorizon, CrowdPushDamping, VerticalAvoidanceRange, ref avoidanceSum, ref neighborCount);
                             }
                             while (SpatialHash.TryGetNextValue(out other, ref it));
                         }
@@ -326,10 +333,18 @@ namespace CustomNavMesh
             int selfIndex, int otherIndex, float3 selfPos, float3 selfPrefVel,
             in NativeArray<float3> positions, in NativeArray<float3> prevVelocities,
             in NativeArray<float> radii, in NativeArray<float> maxSpeeds,
-            float neighborRadius, float timeHorizon, float crowdPushDamping,
+            float neighborRadius, float timeHorizon, float crowdPushDamping, float verticalAvoidanceRange,
             ref float3 avoidanceSum, ref int neighborCount)
         {
             float3 otherPos = positions[otherIndex];
+
+            // separação vertical: sem isso, dois agentes em níveis diferentes (um em cima de
+            // uma muralha/ponte, outro embaixo) se enxergavam como vizinhos só porque a
+            // distância em XZ é pequena, mesmo não podendo de fato colidir. Positions já é a
+            // posição 3D real (rente à malha, inclusive em rampas/estruturas elevadas), então
+            // Y aqui é significativo — não é aproximação.
+            if (math.abs(otherPos.y - selfPos.y) > verticalAvoidanceRange) return;
+
             float3 relPos = new float3(otherPos.x - selfPos.x, 0f, otherPos.z - selfPos.z);
             float dist = math.length(relPos);
             if (dist < 1e-4f || dist > neighborRadius) return;

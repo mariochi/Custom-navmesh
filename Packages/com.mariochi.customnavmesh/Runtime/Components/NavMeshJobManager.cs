@@ -21,10 +21,16 @@ namespace CustomNavMesh
     ///    FindPathsBatchJob, o hash espacial de agentes e o AvoidanceAndMoveJob encadeados
     ///    por dependência, e sincronizar tudo no fim do frame.
     ///
-    /// Pipeline: Schedule em Update() (roda em worker threads durante o resto do Update de
-    /// outros scripts), Complete() em LateUpdate() (ponto de sincronização, antes de
-    /// física/câmera). Isso é o que dá o ganho real de multithreading sobre o
-    /// NavMeshAgent padrão do Unity, que resolve tudo de forma síncrona na main thread.
+    /// Pipeline: os NativeArrays por trás da API (Velocity, IsOnNavMesh, Status,
+    /// SetVelocityOverride, SetPaused, Radius/Height/MaxSpeed etc.) só podem ser lidos ou
+    /// escritos com segurança quando NENHUM Job está em voo. Pra dar essa garantia pra
+    /// qualquer script de gameplay (que roda no Update() dele, execution order padrão),
+    /// Schedule() e Complete() do Job acontecem juntos, na MESMA chamada de LateUpdate()
+    /// (ordem -100, depois de TODO Update() da cena já ter rodado) — ver comentário em
+    /// LateUpdate() pra detalhes e o contrato de quando é seguro chamar a API do agente.
+    /// O ganho de multithreading sobre o NavMeshAgent padrão do Unity continua vindo de
+    /// resolver todos os agentes em PARALELO entre si nos worker threads (não de sobrepor
+    /// com outro código do frame, benefício do qual abrimos mão em troca de correção).
     /// </summary>
     [DefaultExecutionOrder(-100)]
     public class NavMeshJobManager : MonoBehaviour
@@ -58,6 +64,12 @@ namespace CustomNavMesh
         [SerializeField] float neighborQueryRadius = 4f;
         [SerializeField] float avoidanceTimeHorizon = 2f;
         [SerializeField] float defaultWaypointReachDistance = 0.3f;
+        [Tooltip("Diferença de altura (Y) acima da qual dois agentes não se enxergam pra avoidance, " +
+            "mesmo próximos em XZ — sem isso, um agente em cima de uma muralha/ponte e outro embaixo " +
+            "dela se desviam um do outro como se estivessem no mesmo plano. Ajuste pra cobrir a altura " +
+            "típica de um agente (evita ignorar quem está genuinamente ao lado numa rampa suave) sem " +
+            "cobrir a altura de estruturas que devem separar tropas (muralhas, pontes, plataformas).")]
+        [SerializeField] float verticalAvoidanceRange = 2f;
         [Tooltip("Limite de variação de velocidade, como múltiplo de MaxSpeed por segundo (ex.: 8 = " +
             "sai do repouso até a velocidade máxima em ~1/8s). Suaviza mudanças bruscas de direção " +
             "(cruzar de triângulo no flow field, convergência de grupo perto do destino) em vez de " +
@@ -587,7 +599,7 @@ namespace CustomNavMesh
 
         public bool GetIgnoreAvoidance(int index) => index >= 0 && index < count && ignoreAvoidance[index];
 
-        /// <summary>Válido só até o próximo LateUpdate resetar (ver comentário lá) — chame de novo todo frame pra manter.</summary>
+        /// <summary>Válido só até o próximo Update() resetar (ver ExpirePerFrameOverrides) — chame de novo todo frame pra manter.</summary>
         public void SetAvoidanceOverride(int index, float neighborQueryRadius, float timeHorizon)
         {
             if (index < 0 || index >= count) return;
@@ -723,6 +735,12 @@ namespace CustomNavMesh
             if (targetTriangle < 0)
             {
                 Debug.LogWarning($"NavMeshJobManager: destino {destination} está fora da área coberta pelo NavMesh; MoveGroupWithFlowField ignorado.", this);
+                return false;
+            }
+
+            if (!NavMeshQueryUtil.IsAreaAllowed(graph.TriangleArea[targetTriangle], areaMask))
+            {
+                Debug.LogWarning($"NavMeshJobManager: destino {destination} caiu numa área do NavMesh não permitida por areaMask; MoveGroupWithFlowField ignorado.", this);
                 return false;
             }
 
@@ -914,21 +932,12 @@ namespace CustomNavMesh
 
         void Update()
         {
-            // 'frameHandle' do frame anterior já deveria ter sido completado no LateUpdate
-            // anterior; Complete() aqui é só uma garantia (idempotente/rápida se já concluído).
+            // Job do frame anterior foi agendado E completado dentro do LateUpdate anterior
+            // (mesma chamada) -- este Complete() aqui e so uma garantia idempotente. A partir
+            // daqui ate o inicio do NOSSO LateUpdate(), nenhum Job esta em voo: e a janela
+            // segura pra qualquer script de gameplay ler/escrever a API do CustomNavMeshAgent.
             frameHandle.Complete();
             if (frameRequests.IsCreated) frameRequests.Dispose();
-
-            CheckFlowFieldArrivals();
-            CollectRepathRequests();
-            ScheduleFrameJobs();
-        }
-
-        void LateUpdate()
-        {
-            // ponto de sincronização: garante que posição/velocidade estejam prontas antes
-            // de física, câmera, animação etc. lerem o Transform dos agentes nesse frame.
-            frameHandle.Complete();
 
             if (count > 0)
             {
@@ -938,15 +947,38 @@ namespace CustomNavMesh
 
             LogMovementFaults();
             ExpirePerFrameOverrides();
+
+            CheckFlowFieldArrivals();
+            CollectRepathRequests();
+            // NAO agenda os Jobs aqui -- ver LateUpdate(). Agendar so depois que TODO Update()
+            // da cena ja rodou garante que qualquer SetVelocityOverride/SetPaused/SetDestination
+            // chamado por gameplay neste frame ja esta refletido nos arrays antes do Job ler.
+        }
+
+        void LateUpdate()
+        {
+            // So agora -- depois que TODOS os Update() da cena ja rodaram (inclusive scripts
+            // de gameplay que leem/escrevem CustomNavMeshAgent) -- e seguro deixar o Job mexer
+            // nos NativeArrays de novo. Agenda E completa aqui, na MESMA chamada: da pra
+            // agendar mais cedo (em Update) e ganhar overlap com o resto do frame so se nada
+            // mais tocar a API do agente entre o Schedule e o Complete -- como nao da pra
+            // garantir isso pra scripts de terceiros (era exatamente a falha de seguranca
+            // encontrada em revisao: NavMeshMovement.Update() lendo/escrevendo com o Job ja
+            // em voo), esta e a opcao segura. O trabalho ainda roda em paralelo ENTRE os
+            // agentes nos worker threads -- e isso que da o ganho real de perf sobre o
+            // NavMeshAgent padrao, nao o overlap com outro codigo do frame (que era um
+            // beneficio secundario, agora sacrificado em troca de correcao).
+            ScheduleFrameJobs();
+            frameHandle.Complete();
         }
 
         /// <summary>
-        /// SetAvoidanceOverride/SetVelocityOverride são "válidos só neste frame" por design: o
-        /// job deste frame já consumiu os valores atuais (Update -> ScheduleFrameJobs, antes de
-        /// qualquer script de gameplay de execution order default rodar), então é seguro resetar
-        /// aqui — quem quiser manter o override simplesmente chama de novo nesse mesmo frame,
-        /// definindo o valor que vale pro PRÓXIMO frame (mesmo atraso de 1 frame que já existe em
-        /// Positions/PrevVelocities).
+        /// SetAvoidanceOverride/SetVelocityOverride são "válidos só neste frame" por design.
+        /// Chamado no início do Update() (depois do Complete() do job agendado no LateUpdate
+        /// anterior, que já leu/consumiu os valores setados no frame anterior) — resetar aqui,
+        /// antes de qualquer script de gameplay rodar o Update() dele, dá zero atraso real: o
+        /// gameplay pode setar de novo logo em seguida, no mesmo frame, e o LateUpdate() deste
+        /// mesmo frame (que agenda o Job) já vai ler o valor fresco.
         /// </summary>
         void ExpirePerFrameOverrides()
         {
@@ -1071,6 +1103,15 @@ namespace CustomNavMesh
                         End = agent.Destination,
                         AreaMask = agent.AreaMask,
                     });
+
+                    // reseta o cursor NO MOMENTO em que o novo caminho é pedido (não dentro do
+                    // Job): sem isso, um agente que estava no waypoint 5 do corredor ANTERIOR
+                    // começaria o corredor NOVO também no índice 5, pulando curvas iniciais e
+                    // mirando um waypoint que pode nem existir mais no caminho recalculado.
+                    // Seguro fazer aqui (main thread, antes do Job ser agendado) — quando
+                    // AvoidanceAndMoveJob rodar (depois de FindPathsBatchJob, por dependência),
+                    // vai ler cursor=0 já pareado com o corredor recém-escrito.
+                    corridorCursor[agentIdx] = 0;
                 }
 
                 pathHandle = new FindPathsBatchJob
@@ -1135,6 +1176,7 @@ namespace CustomNavMesh
                     TimeHorizon = avoidanceTimeHorizon,
                     SteeringAccelerationFactor = steeringAccelerationFactor,
                     CrowdPushDamping = crowdPushDamping,
+                    VerticalAvoidanceRange = verticalAvoidanceRange,
                     MovementFault = movementFault,
                     FlowFieldIgnoresAvoidance = flowFieldIgnoresAvoidance,
                     Paused = paused,

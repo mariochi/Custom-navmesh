@@ -1036,10 +1036,21 @@ de calibração pra esse tamanho de mapa é o **broad-phase**, não o pathfindin
   mesmo que fornece `NavMeshSurface`). Faltava `using Unity.AI.Navigation;` nos dois
   arquivos que referenciam o tipo (`NavMeshGraphBuilder.cs`, `NavMeshJobManager.cs`) e a
   referência ao assembly `Unity.AI.Navigation` no `CustomNavMesh.Runtime.asmdef` — os
-  dois já corrigidos, e `com.unity.ai.navigation` (`2.0.13`, a versão verificada
-  funcionando neste projeto) agora é uma dependência declarada no `package.json` do
-  pacote. Isso não é mais uma limitação teórica: sem essas correções, o pacote inteiro
-  não compilava em NENHUM projeto que tivesse `com.unity.ai.navigation` instalado.
+  dois já corrigidos.
+- ~~**Dependência `com.unity.ai.navigation` pinada numa versão que exige Unity 6.**~~
+  Resolvido — o `package.json` chegou a declarar `2.0.13` (a versão instalada neste
+  projeto de desenvolvimento), mas a série `2.x` do pacote usa métodos nativos novos de
+  `NavMesh` (`SetLinkActive`, `IsLinkOccupied`, `IsLinkValid`, `SetLinkOwner`) que só
+  existem a partir do **Unity 6 LTS** — importar este pacote num projeto rodando uma
+  versão mais antiga do Editor falhava a compilar DENTRO do próprio código-fonte do
+  `com.unity.ai.navigation` (não no nosso), com erros `CS0117` apontando pra esses
+  métodos. Trocado pra `1.1.6` — mesma API pública de `NavMeshLink` que já usamos
+  (`startPoint`/`endPoint`/`width`/`costModifier`/`bidirectional`/`area`, mesmo
+  namespace `Unity.AI.Navigation`), sem tocar nenhum método nativo exclusivo do Unity 6,
+  compatível a partir de **Unity 2022.3 LTS**. Se seu projeto precisar especificamente
+  da série `2.x` (por outro motivo, ex.: já usa alguma feature nova dela em outro
+  lugar), ajuste a versão de volta no `manifest.json` do SEU projeto — o `package.json`
+  deste pacote só declara o mínimo necessário pra ele funcionar.
 
 ## Arquivos
 

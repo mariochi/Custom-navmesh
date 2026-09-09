@@ -20,7 +20,7 @@ namespace CustomNavMesh
         public NativeReference<int2> CellCount;
 
         /// <summary>Pré-alocado pelo chamador (NavMeshSpatialGrid.Build).</summary>
-        public NativeParallelMultiHashMap<int, int> CellToTriangle;
+        public NativeParallelMultiHashMap<long, int> CellToTriangle;
 
         public void Execute()
         {
@@ -59,7 +59,7 @@ namespace CustomNavMesh
                 {
                     for (int cy = cMin.y; cy <= cMax.y; cy++)
                     {
-                        int key = NavMeshSpatialGrid.CellKey(new int2(cx, cy));
+                        long key = NavMeshSpatialGrid.CellKey(new int2(cx, cy));
                         CellToTriangle.Add(key, t);
                     }
                 }

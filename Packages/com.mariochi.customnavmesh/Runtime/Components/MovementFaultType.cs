@@ -27,5 +27,17 @@ namespace CustomNavMesh
         /// genuinamente preso fora da malha (não é só um solavanco de 1 frame).
         /// </summary>
         LostNavMesh = 2,
+
+        /// <summary>
+        /// O Transform do agente foi movido por fora da API deste pacote (física de
+        /// knockback, root motion de animação, cutscene, etc.) desde a última vez que
+        /// AvoidanceAndMoveJob escreveu nele — a posição externa foi ADOTADA como novo
+        /// ponto de partida da simulação (reclampada na malha, igual um Warp implícito) em
+        /// vez de silenciosamente sobrescrita no próximo frame. Não é necessariamente um
+        /// bug: é o comportamento esperado se o jogo mexe no Transform diretamente. Vale
+        /// investigar só se aparecer sem uma causa conhecida (ver README, "Movendo o
+        /// Transform por fora da API").
+        /// </summary>
+        ExternalPositionAdopted = 3,
     }
 }

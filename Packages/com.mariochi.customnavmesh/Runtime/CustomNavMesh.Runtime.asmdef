@@ -2,6 +2,7 @@
     "name": "CustomNavMesh.Runtime",
     "rootNamespace": "CustomNavMesh",
     "references": [
+        "Unity.AI.Navigation",
         "Unity.Burst",
         "Unity.Collections",
         "Unity.Mathematics"

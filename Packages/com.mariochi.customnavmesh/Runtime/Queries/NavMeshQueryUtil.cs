@@ -56,7 +56,27 @@ namespace CustomNavMesh
                 return b + w * (c - b);
             }
 
-            float denom = 1f / (va + vb + vc);
+            float sum = va + vb + vc;
+
+            // triângulo degenerado (área ~0 — quase colinear ou vértices coincidentes): a
+            // divisão baricêntrica abaixo daria Infinity/NaN. Antes desta checagem, isso só
+            // não quebrava a busca de "triângulo mais próximo" (FindNearestTriangle) por
+            // ACIDENTE — NaN comparado com '<' sempre dá falso, então um candidato NaN nunca
+            // "vencia" a comparação — mas nada garantia isso formalmente, e um triângulo
+            // degenerado ainda podia propagar NaN se fosse testado ISOLADO (ex.:
+            // AvoidanceAndMoveJob.TestTriangleAndNeighbors, que testa o triângulo em cache
+            // sem competir contra nenhum outro candidato antes de aceitar o resultado). Cai
+            // pro vértice mais próximo entre os 3 em vez de arriscar propagar um valor inválido.
+            if (math.abs(sum) < 1e-9f)
+            {
+                float da = math.distancesq(p, a);
+                float db = math.distancesq(p, b);
+                float dc = math.distancesq(p, c);
+                if (da <= db && da <= dc) return a;
+                return db <= dc ? b : c;
+            }
+
+            float denom = 1f / sum;
             float v2 = vb * denom;
             float w2 = vc * denom;
             return a + ab * v2 + ac * w2;
@@ -98,7 +118,7 @@ namespace CustomNavMesh
                         var cell = new int2(cx, cy);
                         if (!grid.IsValidCell(cell)) continue;
 
-                        int key = NavMeshSpatialGrid.CellKey(cell);
+                        long key = NavMeshSpatialGrid.CellKey(cell);
                         if (grid.CellToTriangle.TryGetFirstValue(key, out int triIdx, out var it))
                         {
                             do

@@ -1,9 +1,11 @@
 using System.Collections;
 using System.Collections.Generic;
+using Unity.AI.Navigation; // NavMeshLink — vem do pacote com.unity.ai.navigation, NÃO de UnityEngine.AI
 using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
+using UnityEngine.AI;
 using UnityEngine.Jobs;
 
 namespace CustomNavMesh
@@ -40,8 +42,42 @@ namespace CustomNavMesh
         [SerializeField] int agentCapacity = 256;
         [Tooltip("Quantos pedidos de repath (novo destino) são processados por frame, no máximo. Limita picos de custo quando muitos agentes pedem caminho no mesmo frame.")]
         [SerializeField] int maxPathRequestsPerFrame = 32;
+        [Tooltip("Número máximo de CustomNavMeshObstacle registrados simultaneamente (obstáculos " +
+            "dinâmicos pra avoidance — ver CustomNavMeshObstacle). Pool separado da capacidade de " +
+            "agentes; a maioria dos jogos precisa de bem menos obstáculos dinâmicos que agentes.")]
+        [SerializeField] int obstacleCapacity = 32;
+        [Tooltip("Restringe a coleta de NavMeshLink (ver seção 'NavMeshLink' do README) só " +
+            "aos componentes que pertencem à MESMA cena deste NavMeshJobManager. Desligado " +
+            "(default) preserva o comportamento normal — o NavMesh do Unity já é global por " +
+            "natureza, então escanear a cena inteira é consistente com o resto do pipeline. " +
+            "Só ligue isso se você tem múltiplas áreas logicamente separadas carregadas " +
+            "aditivamente (ex.: instância de masmorra por jogador) e precisa que cada uma " +
+            "só enxergue os links da sua própria cena — como só sobrevive UM " +
+            "NavMeshJobManager por processo (singleton), sem isso ele coletaria NavMeshLink " +
+            "de TODAS as cenas carregadas, mesmo as que 'pertenceriam' a outra instância.")]
+        [SerializeField] bool restrictNavMeshLinksToOwnScene = false;
 
         [Header("Grid do NavMesh (broad-phase de triângulo)")]
+        [Tooltip("Se ligado (default), 'Triangle Grid Cell Size' é ignorado e recalculado " +
+            "automaticamente a cada RebuildGraph() como (comprimento médio de aresta dos " +
+            "triângulos do NavMesh) × 'Auto Cell Size Multiplier' — a regra prática que o " +
+            "README já recomendava calibrar manualmente ('comece em 2-4x o tamanho médio de " +
+            "aresta'), só que sem precisar abrir o Profiler/olhar o Debug.Log e ajustar à " +
+            "mão pra cada navmesh novo. Cobre automaticamente o caso de mapas muito grandes " +
+            "(regra de bolso baseada só no tamanho do mapa dava um grid fino demais quando o " +
+            "navmesh era uma triangulação aberta/grosseira, e grosso demais quando era densa) " +
+            "e reage sozinho a rebakes que mudam a densidade de triângulos. Desligue e ajuste " +
+            "'Triangle Grid Cell Size' manualmente se o automático não performar bem pro seu " +
+            "caso específico (ex.: navmesh com triângulos de tamanho muito desigual, onde uma " +
+            "média simples não representa bem a distribuição real).")]
+        [SerializeField] bool autoTriangleGridCellSize = true;
+        [Tooltip("Multiplicador aplicado sobre o comprimento médio de aresta quando 'Auto " +
+            "Triangle Grid Cell Size' está ligado. Valores maiores = células maiores = menos " +
+            "overhead de grid mas mais candidatos por consulta; menores = mais preciso mas " +
+            "mais células. 3 é um meio-termo razoável dentro da faixa 2-4x recomendada.")]
+        [SerializeField] float autoCellSizeMultiplier = 3f;
+        [Tooltip("Usado como Triangle Grid Cell Size SÓ quando 'Auto Triangle Grid Cell Size' " +
+            "está desligado — calibração 100% manual, comportamento de antes desse campo existir.")]
         [SerializeField] float triangleGridCellSize = 4f;
         [Tooltip("Distância pra considerar dois vértices da triangulação como o mesmo ponto (solda) " +
             "ao montar o grafo de adjacência. Necessário porque NavMesh.CalculateTriangulation() não " +
@@ -60,19 +96,72 @@ namespace CustomNavMesh
             "agente anda) — se o zigue-zague em escadas persistir, suba um pouco; se agentes parecerem " +
             "'grudar' um frame a mais que deveriam ao mudar de triângulo, abaixe.")]
         [SerializeField] float triangleStickyMargin = 0.02f;
+        [Tooltip("Nº máximo de saltos de adjacência que ClampToNavMesh explora (via BFS por " +
+            "NavNeighbors) antes de recorrer à busca irrestrita no grid espacial inteiro, " +
+            "quando o cache local (triângulo atual + 3 vizinhos diretos) não é suficiente " +
+            "pra reconectar a posição do agente nesse frame (empurrão de avoidance grande, " +
+            "cruzamento de vários triângulos pequenos de uma vez). Por caminhar só por " +
+            "adjacência REAL da malha, essa busca NUNCA pode 'atravessar' uma parede/vão " +
+            "fino — diferente da busca irrestrita final (FindNearestTriangle), que aceita o " +
+            "triângulo mais próximo em linha reta mesmo que seja do lado errado de um " +
+            "obstáculo fino (o único ponto do clamp com esse risco; ela só entra em jogo " +
+            "depois que esta camada também falhar). Default 6 cobre movimento bem mais " +
+            "rápido que o normal sem custo perceptível (só roda quando o cache falha, não " +
+            "todo frame); 0 desliga essa camada (comportamento antigo).")]
+        [SerializeField] int wallSafeBfsHops = 6;
+        [Tooltip("Distância (metros) além da qual o Transform de um agente é considerado " +
+            "'movido por fora' da posição escrita pelo AvoidanceAndMoveJob no frame anterior " +
+            "(física de knockback, root motion de animação, cutscene, etc. mexendo direto no " +
+            "Transform em vez de usar SetVelocityOverride). Quando isso acontece, a posição " +
+            "externa é ADOTADA como novo ponto de partida da simulação (reclampada no NavMesh) " +
+            "em vez de silenciosamente sobrescrita no próximo frame. Precisa ser maior que o " +
+            "ruído de ponto flutuante da própria escrita do Job (ínfimo); default (5cm) já " +
+            "cobre isso com folga sem disparar por qualquer tremor sub-milimétrico.")]
+        [SerializeField] float externalMoveTolerance = 0.05f;
         [Tooltip("Master switch pro mecanismo de NotifyNavMeshChanged(): se desligado, chamadas a " +
-            "esse método são ignoradas (útil pra desligar tudo de uma vez em debug/profiling). Não " +
-            "existe detecção automática de mudança no NavMesh — o jogo precisa chamar " +
-            "NotifyNavMeshChanged() explicitamente quando um NavMeshObstacle/portão muda (ver README, " +
-            "'Rebuild automático quando o NavMesh muda', pra saber por que não dá pra fazer isso sozinho).")]
+            "esse método são ignoradas, e o polling de Stale Detection Interval também não age " +
+            "(útil pra desligar tudo de uma vez em debug/profiling). A via recomendada continua " +
+            "sendo o jogo chamar NotifyNavMeshChanged() explicitamente quando um NavMeshObstacle/ " +
+            "portão muda (reage no mesmo frame); Stale Detection Interval é só uma rede de " +
+            "segurança pro caso de esquecimento (ver README, 'Rebuild quando o NavMesh muda').")]
         [SerializeField] bool autoRebuildOnNavMeshChange = true;
         [Tooltip("Janela de silêncio (segundos) depois da última chamada a NotifyNavMeshChanged() antes " +
             "de reconstruir o grafo — evita reconstruir uma vez por chamada quando várias mudanças " +
             "acontecem em sequência rápida (ex.: vários NavMeshObstacle entrando em cena juntos).")]
         [SerializeField] float autoRebuildDebounce = 0.25f;
+        [Tooltip("Rede de segurança pra quando o jogo esquece de chamar NotifyNavMeshChanged() " +
+            "explicitamente: a cada X segundos, compara uma assinatura barata do estado atual " +
+            "(nº de vértices/índices/soma de coordenadas da triangulação, E nº/soma de posição " +
+            "dos NavMeshLink ativos na cena — os dois são checados porque um NavMeshLink " +
+            "mudando não altera a triangulação em si) contra a última usada pro grafo em uso — " +
+            "se DIFERIR, chama NotifyNavMeshChanged() sozinho e loga um aviso. " +
+            "NÃO substitui a chamada explícita (que reage no mesmo frame; isso aqui só pega o " +
+            "esquecimento, com atraso de até este intervalo) e só roda enquanto Auto Rebuild On " +
+            "NavMesh Change estiver ligado. Diferente de um candidato óbvio e descartado " +
+            "(NavMesh.onPreUpdate, que dispara a cada tick do subsistema de navegação MESMO " +
+            "sem nada ter mudado — ver comentário em NotifyNavMeshChanged), este mecanismo só " +
+            "chama CalculateTriangulation() esporadicamente (no ritmo deste intervalo, não a " +
+            "cada tick) e só age quando a assinatura realmente muda, então não corre o risco de " +
+            "reempurrar um debounce que nunca fecha. 0 ou negativo desliga esse polling " +
+            "(comportamento 100% manual, como antes).")]
+        [SerializeField] float staleDetectionInterval = 2f;
 
         [Header("Avoidance")]
+        [Tooltip("Tamanho de célula do grid usado pra achar agentes/obstáculos próximos (broad-phase " +
+            "de avoidance) — não confundir com Triangle Grid Cell Size, que é sobre triângulos do " +
+            "NavMesh. AvoidanceAndMoveJob escala automaticamente a JANELA de busca (quantas células " +
+            "em volta são varridas) pra sempre cobrir o raio de detecção efetivo de cada agente " +
+            "(ver Neighbor Query Radius), então não precisa recalibrar isso manualmente quando algum " +
+            "agente tem Radius bem maior que o normal.")]
         [SerializeField] float neighborCellSize = 2f;
+        [Tooltip("Raio (metros) de busca de vizinhos pra avoidance, valor global (por-agente via " +
+            "SetAvoidanceOverride). ESCALADO PRA CIMA automaticamente por agente — nunca pra baixo — " +
+            "pra garantir um mínimo de 2×Radius desse agente: sem isso, dois agentes com Radius bem " +
+            "maior que este valor (ex.: Radius 5 cada, raio combinado 10, com Neighbor Query Radius " +
+            "no default de 4) podiam estar profundamente sobrepostos fisicamente e MESMO ASSIM nunca " +
+            "virarem candidato um do outro — uma 'parede invisível' de detecção. Pra agentes de " +
+            "Radius normal (bem menor que este valor), o escalonamento não muda nada (fica exatamente " +
+            "neste valor, sem overhead extra).")]
         [SerializeField] float neighborQueryRadius = 4f;
         [SerializeField] float avoidanceTimeHorizon = 2f;
         [SerializeField] float defaultWaypointReachDistance = 0.3f;
@@ -87,11 +176,6 @@ namespace CustomNavMesh
             "(cruzar de triângulo no flow field, convergência de grupo perto do destino) em vez de " +
             "deixar a velocidade saltar direto pro valor desejado todo frame. 0 desliga a suavização.")]
         [SerializeField] float steeringAccelerationFactor = 10f;
-        [Tooltip("0-1: quanto o empurrão de sobreposição é amortecido quando os dois agentes já " +
-            "andam na mesma direção (marchando juntos — comum num grupo grande no mesmo flow " +
-            "field). 1 = sem amortecimento; valores menores (ex.: 0.3) acalmam oscilação em " +
-            "multidão densa/gargalo sem enfraquecer a resposta a colisões de frente/cruzadas.")]
-        [SerializeField, Range(0f, 1f)] float crowdPushDamping = 0.3f;
 
         [Header("Flow Field (grupos)")]
         [Tooltip("Nº máximo de flow fields simultâneos (um por chamada de MoveGroupWithFlowField ainda " +
@@ -114,7 +198,8 @@ namespace CustomNavMesh
         [Tooltip("Desenha uma esfera colorida sobre cada agente com o PathStatus atual: " +
             "cinza = None (nunca pediu path / ainda não processado), verde = Success, " +
             "amarelo = PartialCorridor, vermelho = NoPath, magenta = Invalid (start/end fora do NavMesh), " +
-            "ciano = FlowField (seguindo campo de grupo).")]
+            "ciano = FlowField (seguindo campo de grupo), laranja = BestEffort (destino inalcançável — " +
+            "foi levado até o ponto mais perto possível, dentro da mesma ilha do NavMesh).")]
         [SerializeField] bool drawStatusGizmos = false;
         [Tooltip("Desenha uma seta por triângulo com a direção de fluxo do slot escolhido em Flow Field Gizmo Slot.")]
         [SerializeField] bool drawFlowFieldGizmo = false;
@@ -151,6 +236,7 @@ namespace CustomNavMesh
         NativeArray<byte> pathStatus;
         NativeArray<int> currentTriangle;
         NativeArray<float3> corridorFlat;
+        NativeArray<bool> corridorIsLinkArrival; // mesmo layout de corridorFlat — true[j] = chegar em CorridorFlat[j] é pousar depois de atravessar um NavMeshLink (ver FindPathsBatchJob/AvoidanceAndMoveJob)
         NativeArray<byte> movementFault; // MovementFaultType do frame atual, por agente — diagnóstico (ver AvoidanceAndMoveJob)
         NativeArray<bool> movementFaultLogged; // já logamos esse agente pelo menos uma vez (evita spam no Console)
         NativeArray<bool> paused; // Pause()/Resume() — trava a busca ativa sem descartar corredor/flow field
@@ -168,7 +254,17 @@ namespace CustomNavMesh
         NativeArray<float3> flowFieldPersonalTarget; // por agente — ponto que ele mira de fato perto do alvo (com offset de formação, se houver)
         FlowFieldMeta[] flowFieldMeta; // bookkeeping gerenciado, pequeno, não precisa ser NativeArray
 
-        NativeParallelMultiHashMap<int, int> agentSpatialHash;
+        NativeParallelMultiHashMap<long, int> agentSpatialHash;
+
+        // --- obstáculos dinâmicos (CustomNavMeshObstacle) — pool separado, sem pathfinding
+        // nenhum, só posição/raio/velocidade lidos a cada frame pra virar restrição extra de
+        // ORCA (responsabilidade 100% do agente, não-recíproca — ver AvoidanceAndMoveJob).
+        int obstacleCapacityInternal;
+        int obstacleCount;
+        readonly List<CustomNavMeshObstacle> obstacleComponents = new List<CustomNavMeshObstacle>();
+        NativeArray<float3> obstaclePositions;
+        NativeArray<float3> obstacleVelocities; // estimada por diferença de posição frame a frame — ver RefreshObstacles
+        NativeArray<float> obstacleRadii;
 
         readonly HashSet<int> pendingRepathSet = new HashSet<int>();
         readonly List<int> repathBatchBuffer = new List<int>();
@@ -184,22 +280,183 @@ namespace CustomNavMesh
             public int TargetTriangle;
         }
 
+        /// <summary>
+        /// Todas as instâncias VIVAS (sobrevivendo desde que a destruição automática de
+        /// duplicata foi removida — ver Awake()), independente de qual é o 'Instance'
+        /// estático padrão. Usado só pela rede de segurança de descarte de memória em
+        /// Editor (OnEditorPlayModeStateChanged), que precisa limpar TODAS as instâncias,
+        /// não só a default.
+        /// </summary>
+        static readonly List<NavMeshJobManager> allInstances = new List<NavMeshJobManager>();
+
         void Awake()
         {
-            if (Instance != null && Instance != this)
+            // Antes, uma segunda instância na cena (ou numa cena carregada aditivamente)
+            // era DESTRUÍDA aqui — isso quebrava qualquer setup multi-cena com várias
+            // áreas de navmesh logicamente separadas (ex.: instância de masmorra por
+            // jogador): só a PRIMEIRA instância sobrevivia, e todo agente/obstáculo de
+            // QUALQUER cena carregada se registrava nela — mesmo pertencendo a uma área
+            // com coordenadas/grafo completamente diferentes (ver README, "Múltiplas
+            // instâncias / multi-cena"). Agora cada instância sobrevive e funciona de
+            // forma independente (seu próprio grafo, seus próprios agentes); só a
+            // PRIMEIRA continua virando o 'Instance' estático (o alvo default pra quem
+            // não aponta um manager explícito via CustomNavMeshAgent.Manager/
+            // CustomNavMeshObstacle.Manager) — preserva o comportamento de sempre no caso
+            // comum (uma cena, um manager, zero configuração extra).
+            if (Instance == null)
             {
-                Debug.LogWarning("NavMeshJobManager: já existe uma instância nessa cena; destruindo a duplicada.", this);
-                Destroy(this);
-                return;
+                Instance = this;
             }
-            Instance = this;
+            else if (Instance != this)
+            {
+                Debug.Log($"NavMeshJobManager: '{Instance.name}' já é a instância padrão " +
+                    $"('Instance' estático) — '{name}' continua funcionando normalmente, mas " +
+                    "agentes/obstáculos que não apontarem um manager explícito (ver campo " +
+                    "'Manager' em CustomNavMeshAgent/CustomNavMeshObstacle) vão se registrar " +
+                    $"em '{Instance.name}', não em '{name}'.", this);
+            }
+
+            // guarda contra duplicata: se Awake() rodar de novo pro MESMO objeto sobrevivente
+            // sem que OnDestroy() tenha rodado entre uma sessão de Play e outra (mesmo combo
+            // raro do item 5 acima), evita empilhar referências repetidas na lista estática.
+            if (!allInstances.Contains(this))
+                allInstances.Add(this);
+
+            // rede de segurança pra "Reload Domain" + "Reload Scene" ambos DESLIGADOS
+            // (Project Settings > Editor > Enter Play Mode Settings, combo raro): nesse
+            // modo, o MESMO GameObject/Component sobrevive intacto de uma sessão de Play
+            // pra outra (a cena nunca é descartada), mas Awake() continua rodando de novo
+            // a cada entrada em Play — é assim que o modo rápido funciona. Se os
+            // NativeArrays Allocator.Persistent da sessão ANTERIOR nunca foram dispostos
+            // (OnDestroy só roda quando o objeto é de fato destruído, o que não acontece
+            // se a cena não é recarregada), alocar por cima de novo vazaria memória nativa
+            // a cada ciclo Play/Stop. Detecta isso (algum array ainda IsCreated) e limpa
+            // tudo (nativo + bookkeeping gerenciado) antes de alocar de novo.
+            if (positions.IsCreated)
+                DisposeAllPersistent();
 
             capacity = math.max(1, agentCapacity);
             AllocatePersistent();
         }
 
+#if UNITY_EDITOR
+        static NavMeshJobManager()
+        {
+            UnityEditor.EditorApplication.playModeStateChanged += OnEditorPlayModeStateChanged;
+        }
+
+        /// <summary>
+        /// Segunda camada da mesma rede de segurança (ver comentário em Awake()): força o
+        /// descarte da memória nativa no momento em que o Editor COMEÇA a sair do Play
+        /// Mode, sem depender de MonoBehaviour.OnDestroy() rodar (que pode não rodar no
+        /// combo "Reload Domain"+"Reload Scene" desligados, se o GameObject não chegar a
+        /// ser realmente destruído). Idempotente — DisposeAllPersistent() só mexe em
+        /// arrays que ainda estão IsCreated, então rodar duas vezes (aqui e de novo via um
+        /// OnDestroy() normal, se ele rodar) não tem custo nem risco. Só existe em builds
+        /// de Editor (compilado fora com #if), zero custo/footprint em builds de jogador.
+        /// Itera TODAS as instâncias vivas (allInstances), não só 'Instance' — desde que a
+        /// destruição automática de duplicata foi removida (ver Awake()), pode haver mais
+        /// de uma instância simultânea, e todas precisam da mesma rede de segurança.
+        /// </summary>
+        static void OnEditorPlayModeStateChanged(UnityEditor.PlayModeStateChange state)
+        {
+            if (state != UnityEditor.PlayModeStateChange.ExitingPlayMode) return;
+
+            for (int i = 0; i < allInstances.Count; i++)
+            {
+                if (allInstances[i] != null)
+                    allInstances[i].DisposeAllPersistent();
+            }
+        }
+#endif
+
         Coroutine autoRebuildCoroutine;
         float autoRebuildDeadline;
+        Coroutine staleDetectionCoroutine;
+        NavMeshSignature lastSignature;
+
+        /// <summary>
+        /// Assinatura BARATA do estado atual — não é um hash criptográfico nem uma
+        /// comparação vértice-a-vértice (isso custaria o mesmo que reconstruir o grafo
+        /// inteiro), só o suficiente pra pegar a esmagadora maioria das mudanças reais
+        /// (obstáculo apareceu/sumiu, portão fechou, rebake mudou a malha) sem custar mais
+        /// que a própria chamada a CalculateTriangulation() que já precisa ser feita de
+        /// qualquer jeito pra checar.
+        ///
+        /// Cobre DUAS fontes de mudança independentes: a triangulação em si (Vertex/Index
+        /// Count + CoordSum) E os NavMeshLink da cena (LinkCount + LinkCoordSum) — as duas
+        /// são necessárias porque um NavMeshLink sendo adicionado/movido/(des)ativado/
+        /// removido em runtime NÃO muda a triangulação (NavMesh.CalculateTriangulation()
+        /// não inclui link nenhum, ver NavMeshGraphBuilder.BuildLinks), então uma
+        /// assinatura baseada só na triangulação NUNCA detectaria essa mudança —
+        /// StalenessWatcher ficaria estruturalmente cego a qualquer alteração de link,
+        /// exigindo NotifyNavMeshChanged() manual sempre nesse caso específico (o que não
+        /// estava documentado antes desta assinatura cobrir os dois).
+        /// </summary>
+        readonly struct NavMeshSignature
+        {
+            public readonly int VertexCount;
+            public readonly int IndexCount;
+            public readonly float CoordSum;
+            public readonly int LinkCount;
+            public readonly float LinkCoordSum;
+
+            public NavMeshSignature(int vertexCount, int indexCount, float coordSum, int linkCount, float linkCoordSum)
+            {
+                VertexCount = vertexCount;
+                IndexCount = indexCount;
+                CoordSum = coordSum;
+                LinkCount = linkCount;
+                LinkCoordSum = linkCoordSum;
+            }
+
+            public bool DiffersFrom(NavMeshSignature other)
+            {
+                if (VertexCount != other.VertexCount || IndexCount != other.IndexCount) return true;
+                if (LinkCount != other.LinkCount) return true;
+
+                // tolerância relativa, não fixa: CoordSum/LinkCoordSum são somas de
+                // coordenadas (podem chegar a milhões num mapa grande), e soma em float
+                // perde precisão absoluta conforme o valor cresce — um limiar fixo pequeno
+                // (ex.: 0.001) dispararia falso-positivo por ruído de arredondamento
+                // sozinho em mapas grandes. Falso-positivo aqui é barato (só agenda um
+                // rebuild a mais); falso-negativo é o risco real, então o piso absoluto
+                // (0.001) ainda cobre mapas pequenos onde 1e-5 relativo seria pequeno
+                // demais pra notar.
+                float tolerance = math.max(0.001f, math.abs(CoordSum) * 1e-5f);
+                if (math.abs(CoordSum - other.CoordSum) > tolerance) return true;
+
+                float linkTolerance = math.max(0.001f, math.abs(LinkCoordSum) * 1e-5f);
+                return math.abs(LinkCoordSum - other.LinkCoordSum) > linkTolerance;
+            }
+        }
+
+        static NavMeshSignature ComputeSignature(NavMeshTriangulation tri)
+        {
+            double sum = 0;
+            var verts = tri.vertices;
+            for (int i = 0; i < verts.Length; i++)
+                sum += verts[i].x + verts[i].y + verts[i].z;
+
+            // NavMeshLink não é parte da triangulação — precisa ser escaneado à parte (ver
+            // comentário em NavMeshSignature). Barato: mesmo escaneamento que BuildLinks já
+            // faz, só que aqui é só contagem + soma de posição, sem lookup de triângulo.
+            var links = Object.FindObjectsOfType<NavMeshLink>();
+            int linkCount = 0;
+            double linkSum = 0;
+            for (int i = 0; i < links.Length; i++)
+            {
+                NavMeshLink link = links[i];
+                if (!link.enabled || !link.gameObject.activeInHierarchy) continue;
+
+                linkCount++;
+                float3 s = link.transform.TransformPoint(link.startPoint);
+                float3 e = link.transform.TransformPoint(link.endPoint);
+                linkSum += s.x + s.y + s.z + e.x + e.y + e.z;
+            }
+
+            return new NavMeshSignature(verts.Length, tri.indices.Length, (float)sum, linkCount, (float)linkSum);
+        }
 
         void OnDisable()
         {
@@ -208,6 +465,7 @@ namespace CustomNavMesh
             // acharia (errado) que ainda tem uma corrotina rodando depois de reativado, e o
             // debounce ficaria travado pra sempre (nunca mais chamando StartCoroutine de novo).
             autoRebuildCoroutine = null;
+            staleDetectionCoroutine = null; // mesmo motivo, pro polling de StalenessWatcher
         }
 
         /// <summary>
@@ -222,7 +480,13 @@ namespace CustomNavMesh
         /// do Unity — ou seja, também dispara quando NADA mudou — então não dá pra diferenciar
         /// "mudou" de "só rodou o tick" só com esse evento (uma versão anterior deste método
         /// tentava usar isso com debounce e ficava presa: o prazo nunca vencia, porque o evento
-        /// reempurrava o debounce de novo antes da janela fechar). Por isso o gatilho é explícito.
+        /// reempurrava o debounce de novo antes da janela fechar). Por isso o gatilho é explícito
+        /// — chamar isso continua sendo a via RECOMENDADA (reage no mesmo frame). Como rede de
+        /// segurança pra quando o jogo esquece de chamar, StalenessWatcher (ver Stale Detection
+        /// Interval) chama este método sozinho se detectar, por polling periódico barato (não
+        /// por evento a cada tick — não sofre do problema acima), que a triangulação OU os
+        /// NavMeshLink ativos da cena mudaram (as duas coisas são checadas separadamente —
+        /// um NavMeshLink mudando não altera a triangulação em si, ver NavMeshSignature).
         /// </summary>
         public void NotifyNavMeshChanged()
         {
@@ -251,6 +515,38 @@ namespace CustomNavMesh
             RepathAllAgents();
         }
 
+        /// <summary>
+        /// Rede de segurança: a cada 'staleDetectionInterval' segundos, compara a assinatura
+        /// barata da triangulação atual contra a do grafo em uso (ver NavMeshSignature) e, se
+        /// diferir, chama NotifyNavMeshChanged() sozinho — pega o caso do jogo esquecer de
+        /// notificar explicitamente (NavMeshObstacle, carving, rebake feito por outro sistema
+        /// sem saber que este pacote existe). Roda em polling periódico, não por evento a cada
+        /// tick, então não sofre do problema do NavMesh.onPreUpdate documentado acima (esse
+        /// dispara mesmo sem nada mudar; isso aqui só age quando a assinatura de fato muda).
+        /// Desligado (staleDetectionInterval <= 0) por padrão de custo zero fora do intervalo:
+        /// só chama CalculateTriangulation() uma vez por tick deste laço, nunca por frame.
+        /// </summary>
+        IEnumerator StalenessWatcher()
+        {
+            while (true)
+            {
+                yield return new WaitForSeconds(math.max(0.1f, staleDetectionInterval));
+
+                if (!autoRebuildOnNavMeshChange) continue; // desligado no meio do jogo — não gasta CalculateTriangulation à toa
+                if (!graphReady) continue; // ainda não teve um primeiro RebuildGraph bem-sucedido pra comparar contra
+
+                var signature = ComputeSignature(NavMesh.CalculateTriangulation());
+                if (signature.DiffersFrom(lastSignature))
+                {
+                    Debug.Log("NavMeshJobManager: detectei automaticamente uma mudança na triangulação do NavMesh " +
+                        "sem NotifyNavMeshChanged() ter sido chamado (Stale Detection Interval) — agendando rebuild. " +
+                        "Se isso disparar com frequência, considere chamar NotifyNavMeshChanged() explicitamente no " +
+                        "código que muda o NavMesh (mais responsivo que esperar o próximo tick deste polling).", this);
+                    NotifyNavMeshChanged();
+                }
+            }
+        }
+
         void Start()
         {
             // NÃO construir o grafo no Awake: com [DefaultExecutionOrder(-100)] o Awake deste
@@ -260,7 +556,12 @@ namespace CustomNavMesh
             // antes de QUALQUER Start(), independente de execution order — então esperar até
             // aqui garante que NavMesh.CalculateTriangulation() já vai enxergar a malha.
             if (Instance == this)
+            {
                 RebuildGraph();
+
+                if (staleDetectionInterval > 0f)
+                    staleDetectionCoroutine = StartCoroutine(StalenessWatcher());
+            }
         }
 
         void AllocatePersistent()
@@ -279,6 +580,7 @@ namespace CustomNavMesh
             pathStatus = new NativeArray<byte>(capacity, Allocator.Persistent);
             currentTriangle = new NativeArray<int>(capacity, Allocator.Persistent);
             corridorFlat = new NativeArray<float3>(capacity * NavMeshJobConstants.MaxCorridorPoints, Allocator.Persistent);
+            corridorIsLinkArrival = new NativeArray<bool>(capacity * NavMeshJobConstants.MaxCorridorPoints, Allocator.Persistent);
             movementFault = new NativeArray<byte>(capacity, Allocator.Persistent);
             movementFaultLogged = new NativeArray<bool>(capacity, Allocator.Persistent);
             paused = new NativeArray<bool>(capacity, Allocator.Persistent);
@@ -304,7 +606,14 @@ namespace CustomNavMesh
             // flowFieldDirections/flowFieldDistance dependem de graph.TriangleCount, que só existe depois
             // do primeiro RebuildGraph() (chamado no Start) — alocados/realocados lá, não aqui.
 
-            agentSpatialHash = new NativeParallelMultiHashMap<int, int>(math.max(64, capacity), Allocator.Persistent);
+            obstacleCapacityInternal = math.max(1, obstacleCapacity);
+            obstaclePositions = new NativeArray<float3>(obstacleCapacityInternal, Allocator.Persistent);
+            obstacleVelocities = new NativeArray<float3>(obstacleCapacityInternal, Allocator.Persistent);
+            obstacleRadii = new NativeArray<float>(obstacleCapacityInternal, Allocator.Persistent);
+
+            // capacidade do hashmap cobre agentes E obstáculos — os dois compartilham o mesmo
+            // NativeParallelMultiHashMap (obstáculo usa índice negativo, ver BuildObstacleSpatialHashJob).
+            agentSpatialHash = new NativeParallelMultiHashMap<long, int>(math.max(64, capacity + obstacleCapacityInternal), Allocator.Persistent);
         }
 
         /// <summary>
@@ -320,8 +629,61 @@ namespace CustomNavMesh
             if (triGrid.IsCreated) triGrid.Dispose();
 
             graph = NavMeshGraphBuilder.BuildFromUnityNavMesh(Allocator.Persistent, vertexWeldEpsilon);
-            triGrid = NavMeshSpatialGrid.Build(graph, Allocator.Persistent, triangleGridCellSize);
+
+            // calibração automática do Triangle Grid Cell Size (ver tooltip do campo): pega o
+            // comprimento médio de aresta dos triângulos DESTE grafo e aplica o multiplicador —
+            // mesma regra prática que o README já recomendava calibrar manualmente, mas recalculada
+            // sozinha a cada rebuild (reage a rebakes que mudam a densidade de triângulos, e cobre
+            // mapas de qualquer tamanho sem precisar de ajuste manual por cena).
+            float effectiveCellSize = triangleGridCellSize;
+            if (autoTriangleGridCellSize && graph.TriangleCount > 0)
+            {
+                float avgEdge = NavMeshSpatialGrid.EstimateAverageEdgeLength(graph);
+                effectiveCellSize = math.max(0.01f, avgEdge * autoCellSizeMultiplier);
+            }
+
+            triGrid = NavMeshSpatialGrid.Build(graph, Allocator.Persistent, effectiveCellSize);
             graphReady = graph.TriangleCount > 0;
+
+            // off-mesh links (NavMeshLink da cena) — precisa do triGrid já pronto (usa
+            // FindNearestTriangle) então só roda aqui, não dentro de BuildFromUnityNavMesh.
+            // Sempre aloca os arrays (mesmo vazios) pra manter Dispose() simétrico e todo
+            // consumidor podendo iterar sem checar null.
+            if (graphReady)
+            {
+                NavMeshGraphBuilder.BuildLinks(Allocator.Persistent, triGrid, graph.Vertices, graph.Triangles, graph.AreaCost,
+                    out NativeArray<float3> linkStart, out NativeArray<float3> linkEnd,
+                    out NativeArray<int> linkFromTriangle, out NativeArray<int> linkToTriangle,
+                    out NativeArray<float> linkCost, out NativeArray<byte> linkArea,
+                    out NativeArray<float> linkWidth,
+                    restrictNavMeshLinksToOwnScene ? gameObject.scene : (UnityEngine.SceneManagement.Scene?)null);
+                graph.LinkStart = linkStart;
+                graph.LinkEnd = linkEnd;
+                graph.LinkFromTriangle = linkFromTriangle;
+                graph.LinkToTriangle = linkToTriangle;
+                graph.LinkCost = linkCost;
+                graph.LinkArea = linkArea;
+                graph.LinkWidth = linkWidth;
+
+                if (graph.LinkCount > 0)
+                    Debug.Log($"NavMeshJobManager: {graph.LinkCount} NavMeshLink coletado(s) da cena e conectado(s) ao grafo.", this);
+            }
+            else
+            {
+                graph.LinkStart = new NativeArray<float3>(0, Allocator.Persistent);
+                graph.LinkEnd = new NativeArray<float3>(0, Allocator.Persistent);
+                graph.LinkFromTriangle = new NativeArray<int>(0, Allocator.Persistent);
+                graph.LinkToTriangle = new NativeArray<int>(0, Allocator.Persistent);
+                graph.LinkCost = new NativeArray<float>(0, Allocator.Persistent);
+                graph.LinkArea = new NativeArray<byte>(0, Allocator.Persistent);
+                graph.LinkWidth = new NativeArray<float>(0, Allocator.Persistent);
+            }
+
+            // assinatura da triangulação que ACABOU de ser usada pra montar o grafo — referência
+            // pra StalenessWatcher comparar depois. Custa uma 2ª chamada a CalculateTriangulation()
+            // (a 1ª foi dentro de BuildFromUnityNavMesh, que não expõe a triangulação bruta pra
+            // fora), aceitável aqui porque RebuildGraph já é uma operação pesada e pouco frequente.
+            lastSignature = ComputeSignature(NavMesh.CalculateTriangulation());
 
             // buffers de flow field são dimensionados por TriangleCount — precisam ser realocados
             // toda vez que o grafo muda, e os campos antigos ficam inválidos (índices de triângulo
@@ -352,10 +714,12 @@ namespace CustomNavMesh
                 // se ficar perto de 1 mas o grid tiver poucas células no total, pode ir menor.
                 float coveredX = triGrid.CellCount.x * triGrid.CellSize;
                 float coveredZ = triGrid.CellCount.y * triGrid.CellSize;
+                string cellSizeSource = autoTriangleGridCellSize ? "auto" : "manual";
                 Debug.Log($"NavMeshJobManager: grafo reconstruído — {graph.TriangleCount} triângulos, " +
-                    $"grid {triGrid.CellCount.x}x{triGrid.CellCount.y} células de {triangleGridCellSize}u " +
+                    $"grid {triGrid.CellCount.x}x{triGrid.CellCount.y} células de {triGrid.CellSize:F2}u ({cellSizeSource}) " +
                     $"cobrindo ~{coveredX:F0}x{coveredZ:F0}u. Se path/registro de agente parecer lento, " +
-                    $"ajuste 'Triangle Grid Cell Size' (ver README, seção 'mapas grandes').", this);
+                    $"ajuste 'Auto Cell Size Multiplier' ou desligue 'Auto Triangle Grid Cell Size' e calibre " +
+                    $"'Triangle Grid Cell Size' manualmente (ver README, seção 'Mapas grandes').", this);
             }
 
             for (int i = 0; i < count; i++)
@@ -408,6 +772,24 @@ namespace CustomNavMesh
 
         void OnDestroy()
         {
+            DisposeAllPersistent();
+            allInstances.Remove(this);
+            if (Instance == this) Instance = null;
+        }
+
+        /// <summary>
+        /// Dispõe TODOS os NativeArrays/NativeContainers persistentes e reseta o
+        /// bookkeeping gerenciado (listas/conjuntos/contadores) pro estado "recém-Awake,
+        /// nada registrado ainda". Extraído de OnDestroy() pra também poder ser chamado
+        /// como rede de segurança a partir de Awake()/do hook de Editor (ver comentários
+        /// lá) quando NativeArrays de uma sessão de Play anterior sobrevivem sem terem
+        /// sido dispostos. Idempotente: cada dispose é guardado por IsCreated, então
+        /// chamar isso mais de uma vez em sequência (ex.: pelo hook de Editor e de novo
+        /// pelo OnDestroy() normal logo em seguida) é seguro e não tem custo real na
+        /// segunda vez.
+        /// </summary>
+        void DisposeAllPersistent()
+        {
             frameHandle.Complete();
 
             if (frameRequests.IsCreated) frameRequests.Dispose();
@@ -426,6 +808,7 @@ namespace CustomNavMesh
             if (pathStatus.IsCreated) pathStatus.Dispose();
             if (currentTriangle.IsCreated) currentTriangle.Dispose();
             if (corridorFlat.IsCreated) corridorFlat.Dispose();
+            if (corridorIsLinkArrival.IsCreated) corridorIsLinkArrival.Dispose();
             if (movementFault.IsCreated) movementFault.Dispose();
             if (movementFaultLogged.IsCreated) movementFaultLogged.Dispose();
             if (paused.IsCreated) paused.Dispose();
@@ -440,11 +823,26 @@ namespace CustomNavMesh
             if (flowFieldDistance.IsCreated) flowFieldDistance.Dispose();
             if (flowFieldTargetPoints.IsCreated) flowFieldTargetPoints.Dispose();
             if (agentSpatialHash.IsCreated) agentSpatialHash.Dispose();
+            if (obstaclePositions.IsCreated) obstaclePositions.Dispose();
+            if (obstacleVelocities.IsCreated) obstacleVelocities.Dispose();
+            if (obstacleRadii.IsCreated) obstacleRadii.Dispose();
 
             if (graph.IsCreated) graph.Dispose();
             if (triGrid.IsCreated) triGrid.Dispose();
 
-            if (Instance == this) Instance = null;
+            // bookkeeping gerenciado: só importa resetar quando isso é chamado como rede
+            // de segurança em cima de um estado "sobrevivente" (ver Awake()) — cada
+            // CustomNavMeshAgent/CustomNavMeshObstacle vai se RE-registrar sozinho no
+            // OnEnable() da nova sessão de Play de qualquer forma (mesmo mecanismo que
+            // faz Awake() deste manager rodar de novo), então começar com tudo vazio aqui
+            // é exatamente o estado correto — equivalente a nunca ter tido nada registrado.
+            agentComponents.Clear();
+            obstacleComponents.Clear();
+            pendingRepathSet.Clear();
+            repathBatchBuffer.Clear();
+            count = 0;
+            obstacleCount = 0;
+            graphReady = false;
         }
 
         // ==================== registro de agentes ====================
@@ -467,9 +865,13 @@ namespace CustomNavMesh
             outPositions[index] = positions[index];
             velocities[index] = float3.zero;
             prevVelocities[index] = float3.zero;
-            radii[index] = agent.Radius;
+            radii[index] = math.max(0f, agent.Radius); // defensivo — CustomNavMeshAgent.Radius já clampa, mas não custa garantir aqui também
             maxSpeeds[index] = agent.MaxSpeed;
-            waypointReachDistances[index] = agent.WaypointReachDistance > 0f ? agent.WaypointReachDistance : defaultWaypointReachDistance;
+            // defensivo (math.max) — CustomNavMeshAgent.WaypointReachDistance já clampa o
+            // valor explícito, mas 'defaultWaypointReachDistance' é um campo serializado à
+            // parte (Inspector do manager) que também precisa do mesmo piso.
+            waypointReachDistances[index] = math.max(CustomNavMeshAgent.MinWaypointReachDistance,
+                agent.WaypointReachDistance > 0f ? agent.WaypointReachDistance : defaultWaypointReachDistance);
             heights[index] = agent.Height;
             corridorCursor[index] = 0;
             corridorLength[index] = 0;
@@ -534,7 +936,10 @@ namespace CustomNavMesh
                 int srcBase = last * NavMeshJobConstants.MaxCorridorPoints;
                 int dstBase = index * NavMeshJobConstants.MaxCorridorPoints;
                 for (int i = 0; i < NavMeshJobConstants.MaxCorridorPoints; i++)
+                {
                     corridorFlat[dstBase + i] = corridorFlat[srcBase + i];
+                    corridorIsLinkArrival[dstBase + i] = corridorIsLinkArrival[srcBase + i];
+                }
 
                 agentComponents[index] = agentComponents[last];
                 agentComponents[index].AgentIndex = index;
@@ -559,6 +964,78 @@ namespace CustomNavMesh
 
             ReleaseFlowFieldRef(flowFieldSlot[index]);
             flowFieldSlot[index] = -1;
+        }
+
+        // ==================== registro de obstáculos dinâmicos ====================
+
+        public int RegisterObstacle(CustomNavMeshObstacle obstacle)
+        {
+            frameHandle.Complete(); // só é seguro mexer nos arrays sem job em voo
+
+            if (obstacleCount >= obstacleCapacityInternal)
+            {
+                Debug.LogError($"NavMeshJobManager: capacidade máxima de obstáculos ({obstacleCapacityInternal}) " +
+                    "atingida; aumente 'Obstacle Capacity' no inspector do NavMeshJobManager.", obstacle);
+                return -1;
+            }
+
+            int index = obstacleCount++;
+            obstaclePositions[index] = obstacle.transform.position;
+            obstacleVelocities[index] = float3.zero; // sem histórico ainda — 1º frame sem estimativa de velocidade
+            obstacleRadii[index] = math.max(0f, obstacle.Radius); // defensivo — CustomNavMeshObstacle.Radius já clampa, mas não custa garantir aqui também
+
+            obstacleComponents.Add(obstacle);
+            return index;
+        }
+
+        public void UnregisterObstacle(int index)
+        {
+            if (index < 0 || index >= obstacleCount) return;
+
+            frameHandle.Complete();
+
+            int last = obstacleCount - 1;
+            if (index != last)
+            {
+                obstaclePositions[index] = obstaclePositions[last];
+                obstacleVelocities[index] = obstacleVelocities[last];
+                obstacleRadii[index] = obstacleRadii[last];
+
+                obstacleComponents[index] = obstacleComponents[last];
+                obstacleComponents[index].ObstacleIndex = index;
+            }
+
+            obstacleComponents.RemoveAt(last);
+            obstacleCount--;
+        }
+
+        public float GetObstacleRadius(int index) => index >= 0 && index < obstacleCount ? obstacleRadii[index] : 0f;
+        public void SetObstacleRadius(int index, float value) { if (index >= 0 && index < obstacleCount) obstacleRadii[index] = math.max(0f, value); }
+
+        /// <summary>
+        /// Lê Transform.position de cada obstáculo registrado (main thread — síncrono, mas o
+        /// nº esperado de obstáculos dinâmicos é bem menor que o de agentes, então isso não
+        /// é o mesmo tipo de gargalo que justificou o pipeline em Job pros agentes) e estima
+        /// a velocidade por diferença de posição frame a frame — obstáculos não são
+        /// simulados por este pacote (física/animação/outro script move o Transform deles
+        /// livremente), então não há outra forma de saber a velocidade sem o jogo ter que
+        /// chamar uma API explícita. Chamado no LateUpdate, ANTES de agendar os Jobs do
+        /// frame — mesma garantia de "nenhum Job em voo" que o resto do pipeline.
+        /// </summary>
+        void RefreshObstacles()
+        {
+            if (obstacleCount == 0) return;
+
+            float dt = Time.deltaTime;
+            for (int i = 0; i < obstacleCount; i++)
+            {
+                var obstacle = obstacleComponents[i];
+                if (obstacle == null) continue; // destruído sem passar por OnDisable (raro, ex.: Destroy direto na cena descarregando) — mantém a última posição conhecida
+
+                float3 newPos = obstacle.transform.position;
+                obstacleVelocities[i] = dt > 1e-5f ? (newPos - obstaclePositions[i]) / dt : float3.zero;
+                obstaclePositions[i] = newPos;
+            }
         }
 
         // ==================== pause / warp / avoidance override / tuning ao vivo ====================
@@ -652,14 +1129,14 @@ namespace CustomNavMesh
         }
 
         public float GetRadius(int index) => index >= 0 && index < count ? radii[index] : 0f;
-        public void SetRadius(int index, float value) { if (index >= 0 && index < count) radii[index] = value; }
+        public void SetRadius(int index, float value) { if (index >= 0 && index < count) radii[index] = math.max(0f, value); }
 
         public float GetMaxSpeed(int index) => index >= 0 && index < count ? maxSpeeds[index] : 0f;
         public void SetMaxSpeed(int index, float value) { if (index >= 0 && index < count) maxSpeeds[index] = value; }
 
         public void SetHeight(int index, float value) { if (index >= 0 && index < count) heights[index] = value; }
 
-        public void SetWaypointReachDistance(int index, float value) { if (index >= 0 && index < count) waypointReachDistances[index] = value; }
+        public void SetWaypointReachDistance(int index, float value) { if (index >= 0 && index < count) waypointReachDistances[index] = math.max(CustomNavMeshAgent.MinWaypointReachDistance, value); }
 
         /// <summary>True enquanto o pedido de repath individual de 'index' está na fila (ainda não processado por causa do budget de Max Path Requests Per Frame).</summary>
         public bool IsPathPending(int index) => pendingRepathSet.Contains(index);
@@ -980,6 +1457,7 @@ namespace CustomNavMesh
             // agentes nos worker threads -- e isso que da o ganho real de perf sobre o
             // NavMeshAgent padrao, nao o overlap com outro codigo do frame (que era um
             // beneficio secundario, agora sacrificado em troca de correcao).
+            RefreshObstacles(); // le Transform.position dos CustomNavMeshObstacle antes do Job usar
             ScheduleFrameJobs();
             frameHandle.Complete();
         }
@@ -1037,6 +1515,14 @@ namespace CustomNavMesh
                             "(nem o cache local nem a busca completa no grid acharam nada pra posição dele) — mantido " +
                             "parado na última posição válida. Se ele não se recuperar sozinho em alguns frames, " +
                             "ative Draw Status Gizmos pra ver onde ele está (esfera preta) e investigue a área.",
+                            agentComponents[i]);
+                        break;
+                    case MovementFaultType.ExternalPositionAdopted:
+                        Debug.Log($"NavMeshJobManager: Transform de '{agentName}' foi movido por fora da API " +
+                            "(física/animação/cutscene mexendo direto no Transform) — posição externa adotada e " +
+                            "reclampada no NavMesh. Normal se isso for esperado (ex.: knockback); se NÃO for, " +
+                            "algum script está escrevendo transform.position diretamente em vez de usar " +
+                            "SetVelocityOverride — ver README, 'Movendo o Transform por fora da API'.",
                             agentComponents[i]);
                         break;
                 }
@@ -1114,6 +1600,7 @@ namespace CustomNavMesh
                         Start = positions[agentIdx],
                         End = agent.Destination,
                         AreaMask = agent.AreaMask,
+                        Radius = radii[agentIdx],
                     });
 
                     // reseta o cursor NO MOMENTO em que o novo caminho é pedido (não dentro do
@@ -1136,7 +1623,15 @@ namespace CustomNavMesh
                     AreaCost = graph.AreaCost,
                     TriangleArea = graph.TriangleArea,
                     Grid = triGrid,
+                    LinkStart = graph.LinkStart,
+                    LinkEnd = graph.LinkEnd,
+                    LinkFromTriangle = graph.LinkFromTriangle,
+                    LinkToTriangle = graph.LinkToTriangle,
+                    LinkCost = graph.LinkCost,
+                    LinkArea = graph.LinkArea,
+                    LinkWidth = graph.LinkWidth,
                     CorridorOut = corridorFlat,
+                    CorridorIsLinkArrivalOut = corridorIsLinkArrival,
                     CorridorLengthOut = corridorLength,
                     StatusOut = pathStatus,
                 }.Schedule(requestCount, 4);
@@ -1155,6 +1650,21 @@ namespace CustomNavMesh
                     HashWriter = agentSpatialHash.AsParallelWriter(),
                 }.Schedule(count, 32);
 
+                // obstáculos dinâmicos (CustomNavMeshObstacle) no MESMO hashmap, índice
+                // negativo — roda em paralelo com o hash de agentes (só ESCREVEM, chaves
+                // tipicamente diferentes, sem corrida de dados) e entra na mesma combinação
+                // de dependência antes do AvoidanceAndMoveJob.
+                if (obstacleCount > 0)
+                {
+                    JobHandle obstacleHashHandle = new BuildObstacleSpatialHashJob
+                    {
+                        Positions = obstaclePositions,
+                        CellSize = neighborCellSize,
+                        HashWriter = agentSpatialHash.AsParallelWriter(),
+                    }.Schedule(obstacleCount, 32);
+                    hashHandle = JobHandle.CombineDependencies(hashHandle, obstacleHashHandle);
+                }
+
                 JobHandle deps = JobHandle.CombineDependencies(hashHandle, pathHandle);
 
                 moveHandle = new AvoidanceAndMoveJob
@@ -1164,7 +1674,11 @@ namespace CustomNavMesh
                     Radii = radii,
                     MaxSpeeds = maxSpeeds,
                     SpatialHash = agentSpatialHash,
+                    ObstaclePositions = obstaclePositions,
+                    ObstacleVelocities = obstacleVelocities,
+                    ObstacleRadii = obstacleRadii,
                     CorridorFlat = corridorFlat,
+                    CorridorIsLinkArrival = corridorIsLinkArrival,
                     CorridorLength = corridorLength,
                     WaypointReachDistances = waypointReachDistances,
                     FlowFieldSlot = flowFieldSlot,
@@ -1187,9 +1701,10 @@ namespace CustomNavMesh
                     NeighborQueryRadius = neighborQueryRadius,
                     TimeHorizon = avoidanceTimeHorizon,
                     SteeringAccelerationFactor = steeringAccelerationFactor,
-                    CrowdPushDamping = crowdPushDamping,
                     VerticalAvoidanceRange = verticalAvoidanceRange,
                     TriangleStickyMargin = triangleStickyMargin,
+                    WallSafeBfsHops = wallSafeBfsHops,
+                    ExternalMoveTolerance = externalMoveTolerance,
                     MovementFault = movementFault,
                     FlowFieldIgnoresAvoidance = flowFieldIgnoresAvoidance,
                     Paused = paused,
@@ -1298,6 +1813,7 @@ namespace CustomNavMesh
                 case PathStatus.NoPath: return Color.red;
                 case PathStatus.Invalid: return Color.magenta;
                 case PathStatus.FlowField: return Color.cyan;
+                case PathStatus.BestEffort: return new Color(1f, 0.5f, 0f); // laranja — chegou perto, não no destino real
                 default: return Color.gray; // None
             }
         }

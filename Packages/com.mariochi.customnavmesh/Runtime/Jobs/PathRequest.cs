@@ -17,5 +17,15 @@ namespace CustomNavMesh
 
         /// <summary>Bitmask de áreas permitidas (bit N = área N). uint.MaxValue = todas.</summary>
         public uint AreaMask;
+
+        /// <summary>
+        /// Raio do agente — usado por Funnel.BuildCorridor pra encolher cada portal
+        /// interno (aresta compartilhada entre dois triângulos do corredor) pra dentro por
+        /// até esse valor antes de rodar o funil, mantendo o corredor gerado a pelo menos
+        /// Radius de distância de qualquer aresta/vértice interno no caminho (ver
+        /// comentário em Funnel.BuildCorridor). 0 = sem margem nenhuma (comportamento de
+        /// antes desse campo existir — corredor colado exatamente na geometria).
+        /// </summary>
+        public float Radius;
     }
 }

@@ -1,9 +1,11 @@
 using System.Collections.Generic;
+using Unity.AI.Navigation; // NavMeshLink — vem do pacote com.unity.ai.navigation, NÃO de UnityEngine.AI
 using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.AI;
+using UnityEngine.SceneManagement;
 
 namespace CustomNavMesh
 {
@@ -91,6 +93,125 @@ namespace CustomNavMesh
             }.Schedule().Complete();
 
             return graph;
+        }
+
+        /// <summary>
+        /// Coleta os NavMeshLink (UnityEngine.AI.NavMeshLink — pulos, plataformas, zip-lines
+        /// etc.) ativos da cena e monta arestas "virtuais" extras entre o triângulo mais
+        /// próximo de cada ponta — usadas por FindPathsBatchJob ALÉM da adjacência normal
+        /// (Neighbors). Precisa ser chamado DEPOIS do NavMeshSpatialGrid já estar construído
+        /// (usa FindNearestTriangle pra achar em qual triângulo cada ponta do link cai) —
+        /// por isso não faz parte de BuildFromUnityNavMesh, e sim de uma chamada separada
+        /// do NavMeshJobManager logo depois de montar o grid.
+        ///
+        /// NavMesh.CalculateTriangulation() não devolve NavMeshLink nenhum — são um tipo de
+        /// dado totalmente separado da triangulação baked, então só dá pra descobri-los
+        /// escaneando os componentes da cena diretamente (FindObjectsOfType), não tem atalho.
+        /// Arrays de saída sempre são criados (tamanho 0 se não houver link nenhum) — quem
+        /// consome não precisa checar null, só iterar (loop de tamanho 0 já é um no-op).
+        ///
+        /// <paramref name="restrictToScene"/> (opcional, null = comportamento padrão): o
+        /// `NavMesh` do Unity já é global por natureza (uma única triangulação combinando
+        /// TODOS os tiles/cenas carregadas — `FindObjectsOfType` escanear a cena inteira é
+        /// consistente com isso, não uma falha de escopo). A situação em que isso pega algo
+        /// indesejado é multi-cena ADITIVA com a intenção de várias áreas logicamente
+        /// separadas (ex.: instância de masmorra por jogador) — como só sobrevive UM
+        /// `NavMeshJobManager` por processo (singleton), ele coletaria `NavMeshLink` de
+        /// TODAS as cenas carregadas, mesmo as que "pertenceriam" a outra instância lógica.
+        /// Passe a cena do próprio manager aqui pra restringir a coleta só a componentes
+        /// dessa cena (ver `NavMeshJobManager.restrictNavMeshLinksToOwnScene`, desligado por
+        /// padrão pra preservar o comportamento de antes desse parâmetro existir).
+        /// </summary>
+        public static void BuildLinks(
+            Allocator allocator,
+            in NavMeshSpatialGrid grid,
+            NativeArray<float3> vertices,
+            NativeArray<int3> triangles,
+            NativeArray<float> areaCost,
+            out NativeArray<float3> linkStart,
+            out NativeArray<float3> linkEnd,
+            out NativeArray<int> linkFromTriangle,
+            out NativeArray<int> linkToTriangle,
+            out NativeArray<float> linkCost,
+            out NativeArray<byte> linkArea,
+            out NativeArray<float> linkWidth,
+            Scene? restrictToScene = null)
+        {
+            var starts = new List<float3>();
+            var ends = new List<float3>();
+            var froms = new List<int>();
+            var tos = new List<int>();
+            var costs = new List<float>();
+            var areas = new List<byte>();
+            var widths = new List<float>();
+
+            var links = Object.FindObjectsOfType<NavMeshLink>();
+            for (int i = 0; i < links.Length; i++)
+            {
+                NavMeshLink link = links[i];
+                // FindObjectsOfType() por padrão já não devolve componente de GameObject
+                // inativo, mas o componente em si pode estar desabilitado (checkbox) mesmo
+                // com o GameObject ativo — checa os dois de qualquer forma, defensivamente.
+                if (!link.enabled || !link.gameObject.activeInHierarchy) continue;
+
+                if (restrictToScene.HasValue && link.gameObject.scene != restrictToScene.Value) continue;
+
+                // startPoint/endPoint são em espaço LOCAL do transform do link (documentação
+                // do NavMeshLink) — precisa converter pra world antes de achar o triângulo.
+                float3 worldStart = link.transform.TransformPoint(link.startPoint);
+                float3 worldEnd = link.transform.TransformPoint(link.endPoint);
+
+                int fromTri = NavMeshQueryUtil.FindNearestTriangle(worldStart, grid, vertices, triangles, out _);
+                int toTri = NavMeshQueryUtil.FindNearestTriangle(worldEnd, grid, vertices, triangles, out _);
+                if (fromTri < 0 || toTri < 0)
+                {
+                    Debug.LogWarning($"NavMeshGraphBuilder: NavMeshLink '{link.name}' tem uma ponta " +
+                        "longe demais de qualquer triângulo do NavMesh (fora da área coberta pelo grid) " +
+                        "— ignorado nesta reconstrução do grafo.", link);
+                    continue;
+                }
+
+                byte area = (byte)link.area;
+                // mesma semântica do Unity: costModifier >= 0 é um custo explícito (substitui
+                // o custo da área); costModifier < 0 (default -1) usa o custo da área normal.
+                float baseCost = link.costModifier >= 0f ? link.costModifier : areaCost[area];
+                float cost = math.distance(worldStart, worldEnd) * math.max(baseCost, 0.01f);
+
+                starts.Add(worldStart); ends.Add(worldEnd);
+                froms.Add(fromTri); tos.Add(toTri);
+                costs.Add(cost); areas.Add(area);
+                widths.Add(math.max(0f, link.width));
+
+                if (link.bidirectional)
+                {
+                    // aresta extra no sentido inverso — mesmo custo (a travessia física é a
+                    // mesma nos dois sentidos).
+                    starts.Add(worldEnd); ends.Add(worldStart);
+                    froms.Add(toTri); tos.Add(fromTri);
+                    costs.Add(cost); areas.Add(area);
+                    widths.Add(math.max(0f, link.width));
+                }
+            }
+
+            int n = starts.Count;
+            linkStart = new NativeArray<float3>(n, allocator);
+            linkEnd = new NativeArray<float3>(n, allocator);
+            linkFromTriangle = new NativeArray<int>(n, allocator);
+            linkToTriangle = new NativeArray<int>(n, allocator);
+            linkCost = new NativeArray<float>(n, allocator);
+            linkArea = new NativeArray<byte>(n, allocator);
+            linkWidth = new NativeArray<float>(n, allocator);
+
+            for (int i = 0; i < n; i++)
+            {
+                linkStart[i] = starts[i];
+                linkEnd[i] = ends[i];
+                linkFromTriangle[i] = froms[i];
+                linkToTriangle[i] = tos[i];
+                linkCost[i] = costs[i];
+                linkArea[i] = areas[i];
+                linkWidth[i] = widths[i];
+            }
         }
 
         /// <summary>

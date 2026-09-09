@@ -16,12 +16,12 @@ namespace CustomNavMesh
     {
         [ReadOnly] public NativeArray<float3> Positions;
         public float CellSize;
-        public NativeParallelMultiHashMap<int, int>.ParallelWriter HashWriter;
+        public NativeParallelMultiHashMap<long, int>.ParallelWriter HashWriter;
 
         public void Execute(int index)
         {
             int2 cell = (int2)math.floor(Positions[index].xz / CellSize);
-            int key = AvoidanceAndMoveJob.HashCellKey(cell);
+            long key = AvoidanceAndMoveJob.HashCellKey(cell);
             HashWriter.Add(key, index);
         }
     }

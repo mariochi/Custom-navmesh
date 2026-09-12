@@ -603,6 +603,33 @@ manager, espelhando um `TransformAccessArray`. Remover um agente faz swap-back d
 último índice ativo pro slot liberado (`CustomNavMeshAgent.AgentIndex` é atualizado
 automaticamente quando isso acontece).
 
+## Migrando de UnityEngine.AI.NavMeshAgent — dials extras
+
+Três capacidades adicionadas especificamente pra facilitar migrar um projeto que já usa
+o `NavMeshAgent` nativo intensamente (prioridade de avoidance, aceleração por
+personagem, off-mesh links com hook visual):
+
+- **`CustomNavMeshAgent.AvoidanceYieldWeight`** (default 1, permanente até trocar de
+  novo) — equivalente contínuo ao `avoidancePriority` discreto do `NavMeshAgent` nativo.
+  Quando dois agentes se encontram, cada um assume a fração
+  `otherWeight / (selfWeight + otherWeight)` do ajuste de desvio ORCA — pesos iguais dão
+  exatamente 50/50 (reciprocidade pura, o comportamento de sempre); um peso MAIOR que o
+  do outro agente faz ESTE ceder mais (se desviar mais); um peso MENOR faz o OUTRO ceder
+  mais. Útil pra reimplementar filas/"yield passage" em gargalos: suba o peso de quem já
+  está esperando parado.
+- **`CustomNavMeshAgent.SetAccelerationOverride(float)`/`ClearAccelerationOverride()`**
+  — override por agente da aceleração máxima em unidades/s² ABSOLUTAS (não um múltiplo
+  de `MaxSpeed` como o `Steering Acceleration Factor` global do `NavMeshJobManager`).
+  Válido só até o próximo `Update()` resetar, mesmo contrato de `SetAvoidanceOverride`/
+  `SetVelocityOverride` — chame de novo todo frame enquanto quiser mantê-lo (ex.: mais
+  lento enquanto mira uma habilidade).
+- **`CustomNavMeshAgent.IsTraversingLink`** — true enquanto o agente está atravessando um
+  `NavMeshLink` agora. Serve só como sinal pro jogo tocar uma animação de pulo/queda
+  durante a travessia — a posição em si continua sendo uma reta simples na `MaxSpeed` do
+  agente (o pacote não expõe controle de posição durante o salto, então não há arco
+  parabólico automático; isso ficaria por conta de lógica adicional do próprio jogo, sem
+  suporte direto daqui por enquanto).
+
 ## Múltiplas instâncias / multi-cena
 
 `NavMeshJobManager.Instance` é um singleton estático — pensado pro caso comum (uma cena,

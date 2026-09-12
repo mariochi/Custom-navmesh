@@ -17,6 +17,16 @@ namespace CustomNavMesh
         [SerializeField] float waypointReachDistance = 0.3f;
         [SerializeField] uint areaMask = uint.MaxValue;
 
+        [Tooltip("'Peso de cessão' do ORCA (default 1) — equivalente contínuo ao " +
+            "avoidancePriority discreto do NavMeshAgent nativo. Quando dois agentes se " +
+            "encontram, cada um assume a fração otherWeight/(selfWeight+otherWeight) do " +
+            "ajuste de desvio — pesos iguais dão 50/50 (o default, reciprocidade pura); um " +
+            "peso MAIOR que o do outro agente faz ESTE ceder mais (se desviar mais), um " +
+            "peso MENOR faz o OUTRO ceder mais. Permanente até trocar de novo (ao contrário " +
+            "de SetAvoidanceOverride, não expira a cada frame) — pensado pra representar um " +
+            "estado que muda com pouca frequência (ex.: 'estou esperando passagem').")]
+        [SerializeField] float avoidanceYieldWeight = 1f;
+
         [Tooltip("Deslocamento vertical do Transform em relação ao ponto no NavMesh (equivalente ao " +
             "Base Offset do NavMeshAgent padrão). A simulação (pathfinding/avoidance/corredor) continua " +
             "rente à malha; só a posição final do Transform sobe por esse valor. Use se o pivot do seu " +
@@ -114,6 +124,17 @@ namespace CustomNavMesh
             }
         }
 
+        /// <summary>Ver tooltip do campo serializado equivalente — "peso de cessão" do ORCA, permanente até trocar de novo.</summary>
+        public float AvoidanceYieldWeight
+        {
+            get => AgentIndex >= 0 && Manager != null ? Manager.GetAvoidanceYieldWeight(AgentIndex) : avoidanceYieldWeight;
+            set
+            {
+                avoidanceYieldWeight = math.max(1e-4f, value); // 0/negativo quebraria a divisão otherWeight/(selfWeight+otherWeight)
+                if (AgentIndex >= 0) Manager?.SetAvoidanceYieldWeight(AgentIndex, avoidanceYieldWeight);
+            }
+        }
+
         internal int AgentIndex { get; set; } = -1;
         public PathStatus Status => AgentIndex >= 0 && Manager != null
             ? Manager.GetStatus(AgentIndex) : PathStatus.None;
@@ -129,6 +150,7 @@ namespace CustomNavMesh
         {
             radius = math.max(0f, radius);
             waypointReachDistance = math.max(MinWaypointReachDistance, waypointReachDistance);
+            avoidanceYieldWeight = math.max(1e-4f, avoidanceYieldWeight);
         }
 
         void OnEnable()
@@ -247,6 +269,34 @@ namespace CustomNavMesh
         {
             if (AgentIndex >= 0) Manager?.ClearVelocityOverride(AgentIndex);
         }
+
+        /// <summary>
+        /// Override da aceleração máxima deste agente, em unidades/s² ABSOLUTAS (não um
+        /// múltiplo de MaxSpeed como o Steering Acceleration Factor global) — equivalente a
+        /// setar NavMeshAgent.acceleration dinamicamente por personagem/situação (ex.: mais
+        /// lento enquanto mira uma habilidade). Válido só até o próximo Update() resetar,
+        /// mesmo contrato de SetAvoidanceOverride/SetVelocityOverride — chame de novo todo
+        /// frame enquanto quiser mantê-lo; se parar de chamar, volta a usar o global sozinho.
+        /// </summary>
+        public void SetAccelerationOverride(float maxAcceleration)
+        {
+            if (AgentIndex >= 0) Manager?.SetAccelerationOverride(AgentIndex, maxAcceleration);
+        }
+
+        /// <summary>Normalmente desnecessário — expira sozinho se você simplesmente parar de chamar SetAccelerationOverride.</summary>
+        public void ClearAccelerationOverride()
+        {
+            if (AgentIndex >= 0) Manager?.ClearAccelerationOverride(AgentIndex);
+        }
+
+        /// <summary>
+        /// True enquanto este agente está atravessando um NavMeshLink agora (salto reto
+        /// entre dois pontos, na MaxSpeed do agente — sem arco parabólico, o pacote não expõe
+        /// controle de posição durante o salto). Serve só como sinal pro jogo tocar uma
+        /// animação de pulo/queda durante a travessia. Sempre false em modo flow field
+        /// (MoveGroupWithFlowField não usa links).
+        /// </summary>
+        public bool IsTraversingLink => AgentIndex >= 0 && Manager != null && Manager.GetIsTraversingLink(AgentIndex);
 
         internal bool HasDestination => hasDestination;
         internal float3 Destination => destination;

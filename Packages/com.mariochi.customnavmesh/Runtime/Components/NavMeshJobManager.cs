@@ -228,6 +228,7 @@ namespace CustomNavMesh
         NativeArray<float3> velocities;
         NativeArray<float3> prevVelocities;
         NativeArray<float> radii;
+        NativeArray<float> avoidanceYieldWeight; // "peso de cessão" ORCA, default 1 — ver AvoidanceAndMoveJob.AvoidanceYieldWeight/CustomNavMeshAgent.AvoidanceYieldWeight
         NativeArray<float> maxSpeeds;
         NativeArray<float> waypointReachDistances;
         NativeArray<float> heights;
@@ -245,6 +246,7 @@ namespace CustomNavMesh
         NativeArray<float> timeHorizonOverride; // -1 = usa o global; idem
         NativeArray<float3> velocityOverride; // válido só se hasVelocityOverride[i] — resetado todo frame em LateUpdate
         NativeArray<bool> hasVelocityOverride;
+        NativeArray<float> accelerationOverride; // -1 = usa MaxSpeeds[i] * SteeringAccelerationFactor (o global); resetado todo frame em LateUpdate — ver SetAccelerationOverride
 
         // --- flow field: por agente (capacidade fixa) + pool de campos achatado (depende de TriangleCount) ---
         NativeArray<int> flowFieldSlot; // -1 = agente no modo corredor
@@ -572,6 +574,7 @@ namespace CustomNavMesh
             velocities = new NativeArray<float3>(capacity, Allocator.Persistent);
             prevVelocities = new NativeArray<float3>(capacity, Allocator.Persistent);
             radii = new NativeArray<float>(capacity, Allocator.Persistent);
+            avoidanceYieldWeight = new NativeArray<float>(capacity, Allocator.Persistent);
             maxSpeeds = new NativeArray<float>(capacity, Allocator.Persistent);
             waypointReachDistances = new NativeArray<float>(capacity, Allocator.Persistent);
             heights = new NativeArray<float>(capacity, Allocator.Persistent);
@@ -589,6 +592,7 @@ namespace CustomNavMesh
             timeHorizonOverride = new NativeArray<float>(capacity, Allocator.Persistent);
             velocityOverride = new NativeArray<float3>(capacity, Allocator.Persistent);
             hasVelocityOverride = new NativeArray<bool>(capacity, Allocator.Persistent);
+            accelerationOverride = new NativeArray<float>(capacity, Allocator.Persistent);
             flowFieldSlot = new NativeArray<int>(capacity, Allocator.Persistent);
             flowFieldPersonalTarget = new NativeArray<float3>(capacity, Allocator.Persistent);
 
@@ -598,6 +602,8 @@ namespace CustomNavMesh
                 flowFieldSlot[i] = -1;
                 neighborRadiusOverride[i] = -1f;
                 timeHorizonOverride[i] = -1f;
+                accelerationOverride[i] = -1f;
+                avoidanceYieldWeight[i] = 1f; // default: reciprocidade pura 50/50 (ver AvoidanceYieldWeight)
             }
 
             int ffCapacity = math.max(1, maxFlowFields);
@@ -800,6 +806,7 @@ namespace CustomNavMesh
             if (velocities.IsCreated) velocities.Dispose();
             if (prevVelocities.IsCreated) prevVelocities.Dispose();
             if (radii.IsCreated) radii.Dispose();
+            if (avoidanceYieldWeight.IsCreated) avoidanceYieldWeight.Dispose();
             if (maxSpeeds.IsCreated) maxSpeeds.Dispose();
             if (waypointReachDistances.IsCreated) waypointReachDistances.Dispose();
             if (heights.IsCreated) heights.Dispose();
@@ -817,6 +824,7 @@ namespace CustomNavMesh
             if (timeHorizonOverride.IsCreated) timeHorizonOverride.Dispose();
             if (velocityOverride.IsCreated) velocityOverride.Dispose();
             if (hasVelocityOverride.IsCreated) hasVelocityOverride.Dispose();
+            if (accelerationOverride.IsCreated) accelerationOverride.Dispose();
             if (flowFieldSlot.IsCreated) flowFieldSlot.Dispose();
             if (flowFieldPersonalTarget.IsCreated) flowFieldPersonalTarget.Dispose();
             if (flowFieldDirections.IsCreated) flowFieldDirections.Dispose();
@@ -866,6 +874,7 @@ namespace CustomNavMesh
             velocities[index] = float3.zero;
             prevVelocities[index] = float3.zero;
             radii[index] = math.max(0f, agent.Radius); // defensivo — CustomNavMeshAgent.Radius já clampa, mas não custa garantir aqui também
+            avoidanceYieldWeight[index] = math.max(1e-4f, agent.AvoidanceYieldWeight); // AgentIndex ainda é -1 aqui, então o getter lê o campo serializado local
             maxSpeeds[index] = agent.MaxSpeed;
             // defensivo (math.max) — CustomNavMeshAgent.WaypointReachDistance já clampa o
             // valor explícito, mas 'defaultWaypointReachDistance' é um campo serializado à
@@ -884,6 +893,7 @@ namespace CustomNavMesh
             neighborRadiusOverride[index] = -1f;
             timeHorizonOverride[index] = -1f;
             hasVelocityOverride[index] = false;
+            accelerationOverride[index] = -1f;
             flowFieldSlot[index] = -1;
 
             transformAccessArray.Add(agent.transform);
@@ -915,6 +925,7 @@ namespace CustomNavMesh
                 velocities[index] = velocities[last];
                 prevVelocities[index] = prevVelocities[last];
                 radii[index] = radii[last];
+                avoidanceYieldWeight[index] = avoidanceYieldWeight[last];
                 maxSpeeds[index] = maxSpeeds[last];
                 waypointReachDistances[index] = waypointReachDistances[last];
                 heights[index] = heights[last];
@@ -930,6 +941,7 @@ namespace CustomNavMesh
                 timeHorizonOverride[index] = timeHorizonOverride[last];
                 velocityOverride[index] = velocityOverride[last];
                 hasVelocityOverride[index] = hasVelocityOverride[last];
+                accelerationOverride[index] = accelerationOverride[last];
                 flowFieldSlot[index] = flowFieldSlot[last]; // RefCount do slot não muda — o agente que ocupava 'last' continua usando o mesmo slot, só migrou de índice
                 flowFieldPersonalTarget[index] = flowFieldPersonalTarget[last];
 
@@ -1128,8 +1140,43 @@ namespace CustomNavMesh
             hasVelocityOverride[index] = false;
         }
 
+        /// <summary>
+        /// Override por agente da aceleração máxima, em unidades/s² ABSOLUTAS (não um múltiplo
+        /// de MaxSpeed como Steering Acceleration Factor) — equivalente a setar
+        /// NavMeshAgent.acceleration dinamicamente por personagem/situação (ex.: mais lento
+        /// enquanto mira uma habilidade). Válido só até o próximo Update() resetar (mesmo
+        /// contrato de SetAvoidanceOverride/SetVelocityOverride) — chame de novo todo frame
+        /// enquanto quiser mantê-lo; se parar de chamar, volta a usar o global sozinho.
+        /// </summary>
+        public void SetAccelerationOverride(int index, float maxAcceleration)
+        {
+            if (index < 0 || index >= count) return;
+            accelerationOverride[index] = math.max(0f, maxAcceleration);
+        }
+
+        /// <summary>Normalmente desnecessário — expira sozinho se você simplesmente parar de chamar SetAccelerationOverride.</summary>
+        public void ClearAccelerationOverride(int index)
+        {
+            if (index < 0 || index >= count) return;
+            accelerationOverride[index] = -1f;
+        }
+
         public float GetRadius(int index) => index >= 0 && index < count ? radii[index] : 0f;
         public void SetRadius(int index, float value) { if (index >= 0 && index < count) radii[index] = math.max(0f, value); }
+
+        /// <summary>
+        /// "Peso de cessão" de ORCA (default 1) — equivalente contínuo ao avoidancePriority
+        /// discreto do NavMeshAgent nativo. Quando dois agentes se encontram, cada um assume
+        /// a fração otherWeight/(selfWeight+otherWeight) do ajuste de desvio — pesos iguais
+        /// (o default) dão 50/50; um peso MAIOR que o do outro faz este agente ceder MAIS
+        /// (se desviar mais), e um peso MENOR faz o outro ceder mais pra ele. Ao contrário de
+        /// SetAvoidanceOverride, isto é PERMANENTE até você trocar de novo (não expira a cada
+        /// frame) — mesmo padrão de Radius/MaxSpeed, pensado pra representar um estado que
+        /// muda com pouca frequência (ex.: "estou esperando passagem" vs. "estou andando
+        /// normalmente"), não algo recalculado every frame.
+        /// </summary>
+        public float GetAvoidanceYieldWeight(int index) => index >= 0 && index < count ? avoidanceYieldWeight[index] : 1f;
+        public void SetAvoidanceYieldWeight(int index, float value) { if (index >= 0 && index < count) avoidanceYieldWeight[index] = math.max(1e-4f, value); }
 
         public float GetMaxSpeed(int index) => index >= 0 && index < count ? maxSpeeds[index] : 0f;
         public void SetMaxSpeed(int index, float value) { if (index >= 0 && index < count) maxSpeeds[index] = value; }
@@ -1417,6 +1464,26 @@ namespace CustomNavMesh
                 && math.distance(positions[index], corridorFlat[index * NavMeshJobConstants.MaxCorridorPoints + len - 1]) < waypointReachDistances[index];
         }
 
+        /// <summary>
+        /// True enquanto o agente está atravessando um NavMeshLink AGORA (o waypoint mirado
+        /// pelo corredor é um pouso de salto — ver FindPathsBatchJob.BuildCorridorWithLinks/
+        /// AvoidanceAndMoveJob). Não existe pro modo flow field (que não usa links). Serve
+        /// só como sinal pra jogo tocar uma animação de pulo/queda durante a travessia — a
+        /// posição em si continua sendo uma reta simples na MaxSpeed do agente, sem arco
+        /// parabólico (simplificação deliberada: o pacote não expõe controle de posição
+        /// durante o salto, só esse aviso de "está acontecendo").
+        /// </summary>
+        public bool GetIsTraversingLink(int index)
+        {
+            if (index < 0 || index >= count || flowFieldSlot[index] >= 0) return false;
+
+            int len = corridorLength[index];
+            int cursor = corridorCursor[index];
+            if (len <= 0 || cursor >= len) return false;
+
+            return corridorIsLinkArrival[index * NavMeshJobConstants.MaxCorridorPoints + cursor];
+        }
+
         // ==================== pipeline por frame ====================
 
         void Update()
@@ -1477,6 +1544,7 @@ namespace CustomNavMesh
                 neighborRadiusOverride[i] = -1f;
                 timeHorizonOverride[i] = -1f;
                 hasVelocityOverride[i] = false;
+                accelerationOverride[i] = -1f;
             }
         }
 
@@ -1672,6 +1740,7 @@ namespace CustomNavMesh
                     Positions = positions,
                     PrevVelocities = prevVelocities,
                     Radii = radii,
+                    AvoidanceYieldWeight = avoidanceYieldWeight,
                     MaxSpeeds = maxSpeeds,
                     SpatialHash = agentSpatialHash,
                     ObstaclePositions = obstaclePositions,
@@ -1713,6 +1782,7 @@ namespace CustomNavMesh
                     TimeHorizonOverride = timeHorizonOverride,
                     VelocityOverride = velocityOverride,
                     HasVelocityOverride = hasVelocityOverride,
+                    AccelerationOverride = accelerationOverride,
                 }.Schedule(transformAccessArray, deps);
             }
 

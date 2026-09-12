@@ -47,6 +47,17 @@ namespace CustomNavMesh
         [ReadOnly] public NativeArray<float3> PrevVelocities;
         [ReadOnly] public NativeArray<float> Radii;
         [ReadOnly] public NativeArray<float> MaxSpeeds;
+        /// <summary>
+        /// "Peso de cessão" de ORCA por agente (default 1) — equivalente a uma prioridade
+        /// contínua de avoidance, no lugar do avoidancePriority discreto do NavMeshAgent
+        /// nativo. Quando dois agentes se encontram, cada um assume a fração
+        /// otherWeight/(selfWeight+otherWeight) do ajuste — com pesos iguais (o default),
+        /// isso dá exatamente 50/50 (reciprocidade pura, comportamento de antes deste campo
+        /// existir); um agente com peso MAIOR que o outro cede MAIS (se desvia mais), e um
+        /// com peso menor cede menos (o outro se desvia mais pra ele). Ver
+        /// CustomNavMeshAgent.AvoidanceYieldWeight.
+        /// </summary>
+        [ReadOnly] public NativeArray<float> AvoidanceYieldWeight;
         [ReadOnly] public NativeParallelMultiHashMap<long, int> SpatialHash;
 
         // --- obstáculos dinâmicos (CustomNavMeshObstacle) — no MESMO SpatialHash acima,
@@ -184,6 +195,9 @@ namespace CustomNavMesh
         [ReadOnly] public NativeArray<float3> VelocityOverride;
         [ReadOnly] public NativeArray<bool> HasVelocityOverride;
 
+        /// <summary>Override por agente da aceleração máxima (unidades/s², valor ABSOLUTO — não um múltiplo de MaxSpeed como SteeringAccelerationFactor). -1 = usa MaxSpeeds[index] * SteeringAccelerationFactor (o global). "Válido só neste frame", mesmo contrato dos outros overrides — CustomNavMeshAgent.SetAccelerationOverride/ClearAccelerationOverride.</summary>
+        [ReadOnly] public NativeArray<float> AccelerationOverride;
+
         public void Execute(int index, TransformAccess transform)
         {
             MovementFault[index] = (byte)MovementFaultType.None;
@@ -259,8 +273,8 @@ namespace CustomNavMesh
                 // atravessa direto pro resultado sem passar pelo avoidance, exatamente como no
                 // esquema anterior (a colisão entre agentes nunca foi modelada no eixo Y).
                 float2 orcaVel = ComputeOrcaVelocity(
-                    index, pos.xz, prefVel.xz, PrevVelocities[index].xz, Radii[index], MaxSpeeds[index], DeltaTime,
-                    in Positions, in PrevVelocities, in Radii, in SpatialHash, NeighborCellSize,
+                    index, pos.xz, prefVel.xz, PrevVelocities[index].xz, Radii[index], AvoidanceYieldWeight[index], MaxSpeeds[index], DeltaTime,
+                    in Positions, in PrevVelocities, in Radii, in AvoidanceYieldWeight, in SpatialHash, NeighborCellSize,
                     in ObstaclePositions, in ObstacleVelocities, in ObstacleRadii,
                     effectiveRadius, effectiveTimeHorizon, VerticalAvoidanceRange, pos.y);
 
@@ -292,7 +306,14 @@ namespace CustomNavMesh
                 // suaviza a transição a partir da velocidade do frame anterior em vez de saltar
                 // direto pra velocidade desejada — é isso que tira o zigue-zague/solavanco de
                 // mudanças bruscas de direção alvo (cruzar de triângulo, convergência de grupo).
-                newVel = SmoothVelocity(PrevVelocities[index], newVel, MaxSpeeds[index] * SteeringAccelerationFactor);
+                // AccelerationOverride[index] >= 0 substitui o global por um valor ABSOLUTO
+                // (unidades/s²) só neste frame — equivalente a NavMeshAgent.acceleration
+                // sendo setado dinamicamente por personagem/situação (ex.: mais lento mirando
+                // uma habilidade).
+                float maxAcceleration = AccelerationOverride[index] >= 0f
+                    ? AccelerationOverride[index]
+                    : MaxSpeeds[index] * SteeringAccelerationFactor;
+                newVel = SmoothVelocity(PrevVelocities[index], newVel, maxAcceleration);
             }
 
             // Se o waypoint que este agente está mirando agora é um pouso de NavMeshLink
@@ -425,8 +446,9 @@ namespace CustomNavMesh
         /// nunca da ordem de chegada em memória.
         /// </summary>
         static float2 ComputeOrcaVelocity(
-            int selfIndex, float2 selfPos2D, float2 selfPrefVel2D, float2 selfCurVel2D, float selfRadius, float maxSpeed, float deltaTime,
+            int selfIndex, float2 selfPos2D, float2 selfPrefVel2D, float2 selfCurVel2D, float selfRadius, float selfYieldWeight, float maxSpeed, float deltaTime,
             in NativeArray<float3> positions, in NativeArray<float3> prevVelocities, in NativeArray<float> radii,
+            in NativeArray<float> avoidanceYieldWeight,
             in NativeParallelMultiHashMap<long, int> spatialHash, float cellSize,
             in NativeArray<float3> obstaclePositions, in NativeArray<float3> obstacleVelocities, in NativeArray<float> obstacleRadii,
             float neighborRadius, float timeHorizon, float verticalAvoidanceRange, float selfY)
@@ -487,14 +509,20 @@ namespace CustomNavMesh
 
                 if (other >= 0)
                 {
-                    // vizinho é outro CustomNavMeshAgent — reciprocidade real, cada
-                    // lado assume metade do ajuste (ver ComputeOrcaLine).
+                    // vizinho é outro CustomNavMeshAgent — reciprocidade REAL, mas não
+                    // necessariamente 50/50: cada lado assume otherWeight/(selfWeight+
+                    // otherWeight) do ajuste (ver AvoidanceYieldWeight). Pesos iguais (o
+                    // default) dão exatamente 0.5 — mesmo resultado de antes deste
+                    // mecanismo existir. O outro agente calcula o MESMO par de pesos do
+                    // lado dele e assume a fração complementar (soma sempre 1), então
+                    // isso continua sendo reciprocidade de verdade, só que ponderada.
                     if (other == selfIndex) continue;
 
                     otherPos3 = positions[other];
                     otherRadius = radii[other];
                     otherVel2D = prevVelocities[other].xz;
-                    responsibility = 0.5f;
+                    float otherWeight = avoidanceYieldWeight[other];
+                    responsibility = otherWeight / math.max(1e-4f, selfYieldWeight + otherWeight);
                 }
                 else
                 {

@@ -187,6 +187,16 @@ namespace CustomNavMesh
             "ao seu ponto exato de chegada — a reta final passa a respeitar a malha em vez de seguir " +
             "linha reta ingênua até o ponto de formação.")]
         [SerializeField] float flowFieldArriveDistance = 2f;
+        [Tooltip("Nº de passadas de suavização (blur) aplicadas sobre a direção do flow field após o " +
+            "gradiente — reduz o viés de grade que o Dijkstra herda em triangulações regulares/alinhadas " +
+            "a grid (chão em tiles, voxel/tile size pequeno no bake), que sem isso aparece como agentes " +
+            "colando nas mesmas direções de grade e convergindo em fileiras retas/diagonais em vez de um " +
+            "leque suave (\"zig-zag em degrau\"). 0 desliga (comportamento antigo). Custo é pago uma vez " +
+            "por MoveGroupWithFlowField, não por frame — pode subir sem medo de custo por agente; 2-3 " +
+            "costuma bastar, valores muito altos começam a cortar caminho perto de quinas/obstáculos " +
+            "finos (o blur só mistura entre triângulos já conectados ao alvo, mas ainda assim arredonda " +
+            "curvas apertadas).")]
+        [SerializeField] int flowFieldDirectionSmoothingIterations = 2;
         [Tooltip("TESTE DIAGNÓSTICO: se marcado, agentes em modo flow field pulam o avoidance inteiro " +
             "(não consultam vizinhos, seguem só a direção do campo + suavização de velocidade) — pode " +
             "se sobrepor entre si. Serve pra isolar se um zigue-zague residual vem do avoidance.")]
@@ -1302,6 +1312,7 @@ namespace CustomNavMesh
                 TargetTriangle = targetTriangle,
                 SlotOffset = slot * graph.TriangleCount,
                 AreaMask = areaMask,
+                DirectionSmoothingIterations = flowFieldDirectionSmoothingIterations,
                 DirectionsOut = flowFieldDirections,
                 DistanceOut = flowFieldDistance,
             }.Schedule().Complete();

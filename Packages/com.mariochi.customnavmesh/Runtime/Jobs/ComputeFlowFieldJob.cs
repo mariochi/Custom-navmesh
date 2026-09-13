@@ -48,6 +48,19 @@ namespace CustomNavMesh
         public int SlotOffset;
         public uint AreaMask;
 
+        /// <summary>
+        /// Nº de passadas de suavização (blur) aplicadas sobre a direção final, cada uma
+        /// misturando a direção de cada triângulo com a dos vizinhos válidos (mesma ideia de
+        /// suavização de normais por vértice). 0 desliga (comportamento antigo, só o gradiente
+        /// cru). Ver comentário grande acima de SmoothDirections() pro motivo disso existir:
+        /// o gradiente por triângulo já é bem mais suave que o método antigo (vetor fixo pro
+        /// melhor vizinho), mas ainda herda um viés de grade de baixa frequência de COMO o
+        /// Dijkstra andou pela malha quando a triangulação é regular/alinhada a grid (chão em
+        /// tiles) — o blur ataca justamente essa componente de baixa frequência, sem precisar
+        /// refazer o Dijkstra nem pagar um funil por agente.
+        /// </summary>
+        public int DirectionSmoothingIterations;
+
         public NativeArray<float3> DirectionsOut; // tamanho maxFlowFields * nº de triângulos
         public NativeArray<float> DistanceOut;
 
@@ -168,6 +181,71 @@ namespace CustomNavMesh
             vertexDistance.Dispose();
             heap.Dispose();
             closed.Dispose();
+
+            if (DirectionSmoothingIterations > 0) SmoothDirections(n);
+        }
+
+        /// <summary>
+        /// Suaviza DirectionsOut[SlotOffset..] com N passadas de blur por vizinhança (cada
+        /// triângulo vira a média — normalizada — da sua própria direção com a dos vizinhos
+        /// válidos do MESMO lado do campo, ou seja, só entre triângulos com distância finita;
+        /// nunca atravessa pra um vizinho fora de alcance/área proibida, então não puxa
+        /// direção de um lado sem conexão real com o alvo).
+        ///
+        /// Por quê: o gradiente reconstruído em Execute() já resolve o zig-zag "duro" de
+        /// escolher entre os 3 vizinhos discretamente (ver comentário da classe), mas a
+        /// DISTÂNCIA de onde ele vem ainda é a soma de passos do Dijkstra sobre a adjacência
+        /// da malha — em triangulações bem irregulares (Recast normal, chão aberto) isso mal
+        /// se nota, mas quanto mais REGULAR/alinhada a grid for a triangulação (chão em tiles,
+        /// voxel/tile size pequeno no bake), mais a distância favorece as direções dos EIXOS
+        /// da grade, e o gradiente herda esse viés — na prática, grupos grandes convergindo
+        /// pro mesmo alvo colam nas mesmas duas ou três direções "de grade" e acabam alinhados
+        /// em fileiras retas/diagonais (visualmente um zig-zag "em degrau"), em vez de convergir
+        /// num leque suave. Um blur local acha o meio-termo entre triângulos vizinhos
+        /// (frequência alta = ruído/viés de grade) sem apagar a tendência geral rumo ao alvo
+        /// (frequência baixa = real, sobrevive à média porque é compartilhada por toda a
+        /// vizinhança). Custo é O(triângulos × iterações), pago uma vez por
+        /// MoveGroupWithFlowField (não é hot path por frame).
+        /// </summary>
+        void SmoothDirections(int n)
+        {
+            var buffer = new NativeArray<float3>(n, Allocator.Temp);
+
+            for (int iter = 0; iter < DirectionSmoothingIterations; iter++)
+            {
+                for (int t = 0; t < n; t++)
+                {
+                    float dCenter = DistanceOut[SlotOffset + t];
+                    float3 own = DirectionsOut[SlotOffset + t];
+                    if (t == TargetTriangle || dCenter >= float.MaxValue || math.all(own == float3.zero))
+                    {
+                        buffer[t] = own; // fora de alcance ou é o próprio alvo — não participa do blur
+                        continue;
+                    }
+
+                    float3 sum = own;
+                    int weight = 1;
+                    int3 nbs = Neighbors[t];
+                    for (int e = 0; e < 3; e++)
+                    {
+                        int nb = nbs[e];
+                        if (nb < 0 || DistanceOut[SlotOffset + nb] >= float.MaxValue) continue;
+
+                        float3 nbDir = DirectionsOut[SlotOffset + nb];
+                        if (math.all(nbDir == float3.zero)) continue; // vizinho é o próprio alvo (direção nula por definição) — não puxa a média pra zero
+
+                        sum += nbDir;
+                        weight++;
+                    }
+
+                    buffer[t] = math.normalizesafe(sum, own);
+                }
+
+                // troca DirectionsOut <-> buffer pro conteúdo da próxima iteração ler o resultado desta
+                for (int t = 0; t < n; t++) DirectionsOut[SlotOffset + t] = buffer[t];
+            }
+
+            buffer.Dispose();
         }
 
         /// <summary>Rede de segurança: aponta pro ponto médio da aresta compartilhada com o vizinho de menor distância (método antigo).</summary>

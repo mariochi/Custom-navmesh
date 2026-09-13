@@ -179,6 +179,36 @@ namespace CustomNavMesh
         /// </summary>
         public NativeArray<byte> MovementFault;
 
+        /// <summary>
+        /// Acumulador por agente (segundos consecutivos sem progresso real enquanto tenta se
+        /// mover) usado por MovementFaultType.NoProgress — ver comentário lá. Persiste entre
+        /// frames (não é resetado no topo de Execute() como MovementFault); só é zerado aqui
+        /// mesmo, quando o agente volta a progredir, ou externamente pelo manager no
+        /// (Un)RegisterAgent (reaproveitamento de índice).
+        /// </summary>
+        public NativeArray<float> NoProgressTime;
+
+        /// <summary>Segundos sem progresso real antes de sinalizar MovementFaultType.NoProgress. &lt;= 0 desliga a detecção inteira (comportamento antigo, sem custo extra).</summary>
+        public float NoProgressThresholdSeconds;
+
+        /// <summary>
+        /// Fração de MaxSpeed que a velocidade PREFERIDA (antes do avoidance) precisa atingir
+        /// pra este agente contar como "tentando se mover de verdade" neste frame — abaixo
+        /// disso (ex.: já quase chegando, freando de propósito via SeekTarget) não acumula
+        /// tempo de NoProgress, senão um agente parando normalmente perto do alvo dispararia
+        /// falso positivo.
+        /// </summary>
+        public float NoProgressMinIntendedSpeedFraction;
+
+        /// <summary>
+        /// Fração da distância que o agente deveria ter percorrido neste frame (velocidade
+        /// preferida × DeltaTime) que ele precisa cobrir de verdade (em XZ) pra NÃO contar
+        /// como "sem progresso" — 1.0 exigiria progresso perfeito (falso positivo constante,
+        /// avoidance sempre desvia um pouco da preferida); um valor baixo (ex. 0.05 = 5%)
+        /// só pega o caso patológico de ficar realmente parado no lugar.
+        /// </summary>
+        public float NoProgressMinProgressFraction;
+
         /// <summary>Agente pausado: não busca ativamente o corredor/flow field (prefVel=0), mas continua recebendo/aplicando avoidance — outros agentes o veem como obstáculo e ele reage se empurrado. Corredor/cursor/flow field ficam intocados.</summary>
         [ReadOnly] public NativeArray<bool> Paused;
 
@@ -332,6 +362,36 @@ namespace CustomNavMesh
 
             float3 newPos = pos + newVel * DeltaTime;
             newPos = ClampToNavMesh(index, pos, newPos, duringLinkJump); // rente à malha — usado como verdade pra simulação
+
+            // detecção de "tentando se mover e não consegue" (ver MovementFaultType.NoProgress)
+            // — roda incondicionalmente do resultado de cima (skipAvoidance, override etc. não
+            // importam aqui, só "quanto ele queria andar" vs "quanto andou de verdade").
+            if (NoProgressThresholdSeconds > 0f)
+            {
+                float intendedSpeed = math.length(prefVel.xz);
+                float minIntendedSpeed = MaxSpeeds[index] * NoProgressMinIntendedSpeedFraction;
+
+                if (intendedSpeed >= minIntendedSpeed)
+                {
+                    float movedDist = math.distance(newPos.xz, pos.xz);
+                    float expectedMinMove = intendedSpeed * DeltaTime * NoProgressMinProgressFraction;
+
+                    if (movedDist < expectedMinMove)
+                    {
+                        float t = NoProgressTime[index] + DeltaTime;
+                        NoProgressTime[index] = t;
+                        if (t >= NoProgressThresholdSeconds && MovementFault[index] == (byte)MovementFaultType.None)
+                            MovementFault[index] = (byte)MovementFaultType.NoProgress;
+                    }
+                    else
+                    {
+                        NoProgressTime[index] = 0f;
+                    }
+                }
+                // else: velocidade preferida abaixo do piso (ex.: freando de propósito perto do
+                // alvo) — não conta pra nenhum dos dois lados, só ignora o frame; NoProgressTime
+                // fica como estava (só zera no branch de progresso real, acima).
+            }
 
             transform.position = newPos + new float3(0f, Heights[index], 0f); // só o visual sobe
             OutPositions[index] = newPos;

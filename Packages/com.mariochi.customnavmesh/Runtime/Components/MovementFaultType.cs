@@ -39,5 +39,22 @@ namespace CustomNavMesh
         /// Transform por fora da API").
         /// </summary>
         ExternalPositionAdopted = 3,
+
+        /// <summary>
+        /// O agente está tentando se mover (velocidade preferida — corredor, flow field ou
+        /// override — acima de um piso configurável de MaxSpeed) mas sua posição não avança
+        /// de verdade há mais de <c>NoProgressThresholdSeconds</c> segundos seguidos. Ao
+        /// contrário de LostNavMesh (nenhum triângulo achado pra posição), aqui o
+        /// ClampToNavMesh continua achando um triângulo válido normalmente — o agente
+        /// simplesmente não consegue atravessar na direção que está tentando ir (ex.: uma
+        /// borda real do NavMesh bem onde o flow field/corredor está mandando ele ir,
+        /// avoidance empurrando de volta pro mesmo ponto todo frame). Sem essa detecção, um
+        /// agente nessa situação fica com MovementFault = None pra sempre — velocidade
+        /// calculada não-zero, posição idêntica frame após frame, sem nenhum sinal de que
+        /// algo está errado. Não é auto-recuperável pelo pacote (a causa pode ser legítima —
+        /// um buraco real na malha, uma multidão travando um gargalo) — é só visibilidade;
+        /// quem consome decide o que fazer (redirecionar, repath por outro destino, etc.).
+        /// </summary>
+        NoProgress = 4,
     }
 }

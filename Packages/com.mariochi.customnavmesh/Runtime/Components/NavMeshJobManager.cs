@@ -118,6 +118,24 @@ namespace CustomNavMesh
             "ruído de ponto flutuante da própria escrita do Job (ínfimo); default (5cm) já " +
             "cobre isso com folga sem disparar por qualquer tremor sub-milimétrico.")]
         [SerializeField] float externalMoveTolerance = 0.05f;
+        [Tooltip("Segundos consecutivos sem progresso real (posição não avança) enquanto o agente " +
+            "está tentando se mover de verdade antes de sinalizar MovementFaultType.NoProgress — " +
+            "diferente de LostNavMesh, aqui o ClampToNavMesh continua achando triângulo normalmente; " +
+            "o agente só não consegue avançar na direção que está tentando ir (ex.: borda real do " +
+            "NavMesh onde o flow field/corredor manda ele ir, gargalo de avoidance). Sem isso, esse " +
+            "caso fica com MovementFault = None pra sempre — velocidade calculada não-zero, posição " +
+            "idêntica frame após frame, sem NENHUM sinal de que algo está errado. <= 0 desliga a " +
+            "detecção (comportamento antigo, sem custo extra).")]
+        [SerializeField] float noProgressThresholdSeconds = 2f;
+        [Tooltip("Fração de MaxSpeed que a velocidade PREFERIDA (antes do avoidance) precisa atingir " +
+            "pra contar como 'tentando se mover de verdade' pro NoProgress acima — abaixo disso (ex.: " +
+            "freando de propósito perto do alvo) não acumula, evita falso positivo ao parar normalmente.")]
+        [SerializeField] float noProgressMinIntendedSpeedFraction = 0.3f;
+        [Tooltip("Fração da distância esperada (velocidade preferida × DeltaTime) que o agente precisa " +
+            "cobrir de verdade pra NÃO contar como 'sem progresso' nesse frame — baixo de propósito " +
+            "(default 5%) pra não disparar só porque o avoidance desviou um pouco da direção preferida; " +
+            "só pega o caso patológico de ficar realmente parado no lugar.")]
+        [SerializeField] float noProgressMinProgressFraction = 0.05f;
         [Tooltip("Master switch pro mecanismo de NotifyNavMeshChanged(): se desligado, chamadas a " +
             "esse método são ignoradas, e o polling de Stale Detection Interval também não age " +
             "(útil pra desligar tudo de uma vez em debug/profiling). A via recomendada continua " +
@@ -250,6 +268,7 @@ namespace CustomNavMesh
         NativeArray<bool> corridorIsLinkArrival; // mesmo layout de corridorFlat — true[j] = chegar em CorridorFlat[j] é pousar depois de atravessar um NavMeshLink (ver FindPathsBatchJob/AvoidanceAndMoveJob)
         NativeArray<byte> movementFault; // MovementFaultType do frame atual, por agente — diagnóstico (ver AvoidanceAndMoveJob)
         NativeArray<bool> movementFaultLogged; // já logamos esse agente pelo menos uma vez (evita spam no Console)
+        NativeArray<float> noProgressTime; // acumulador (segundos) pra MovementFaultType.NoProgress — ver comentário no job
         NativeArray<bool> paused; // Pause()/Resume() — trava a busca ativa sem descartar corredor/flow field
         NativeArray<bool> ignoreAvoidance; // por agente, permanente até trocar de novo
         NativeArray<float> neighborRadiusOverride; // -1 = usa o global; resetado todo frame em LateUpdate (válido só 1 frame)
@@ -596,6 +615,7 @@ namespace CustomNavMesh
             corridorIsLinkArrival = new NativeArray<bool>(capacity * NavMeshJobConstants.MaxCorridorPoints, Allocator.Persistent);
             movementFault = new NativeArray<byte>(capacity, Allocator.Persistent);
             movementFaultLogged = new NativeArray<bool>(capacity, Allocator.Persistent);
+            noProgressTime = new NativeArray<float>(capacity, Allocator.Persistent); // zerado por padrão pelo NativeArray
             paused = new NativeArray<bool>(capacity, Allocator.Persistent);
             ignoreAvoidance = new NativeArray<bool>(capacity, Allocator.Persistent);
             neighborRadiusOverride = new NativeArray<float>(capacity, Allocator.Persistent);
@@ -828,6 +848,7 @@ namespace CustomNavMesh
             if (corridorIsLinkArrival.IsCreated) corridorIsLinkArrival.Dispose();
             if (movementFault.IsCreated) movementFault.Dispose();
             if (movementFaultLogged.IsCreated) movementFaultLogged.Dispose();
+            if (noProgressTime.IsCreated) noProgressTime.Dispose();
             if (paused.IsCreated) paused.Dispose();
             if (ignoreAvoidance.IsCreated) ignoreAvoidance.Dispose();
             if (neighborRadiusOverride.IsCreated) neighborRadiusOverride.Dispose();
@@ -898,6 +919,7 @@ namespace CustomNavMesh
             currentTriangle[index] = -1;
             movementFault[index] = (byte)MovementFaultType.None;
             movementFaultLogged[index] = false; // slot pode ter sido usado por outro agente antes (swap-remove reaproveita índice)
+            noProgressTime[index] = 0f;
             paused[index] = false;
             ignoreAvoidance[index] = agent.IgnoreAvoidance; // AgentIndex do 'agent' ainda é -1 aqui, então o getter lê o campo serializado local
             neighborRadiusOverride[index] = -1f;
@@ -945,6 +967,7 @@ namespace CustomNavMesh
                 currentTriangle[index] = currentTriangle[last];
                 movementFault[index] = movementFault[last];
                 movementFaultLogged[index] = movementFaultLogged[last];
+                noProgressTime[index] = noProgressTime[last];
                 paused[index] = paused[last];
                 ignoreAvoidance[index] = ignoreAvoidance[last];
                 neighborRadiusOverride[index] = neighborRadiusOverride[last];
@@ -1604,6 +1627,15 @@ namespace CustomNavMesh
                             "SetVelocityOverride — ver README, 'Movendo o Transform por fora da API'.",
                             agentComponents[i]);
                         break;
+                    case MovementFaultType.NoProgress:
+                        Debug.LogWarning($"NavMeshJobManager: '{agentName}' está tentando se mover mas não " +
+                            $"progride de verdade há mais de {noProgressThresholdSeconds:F1}s — provavelmente " +
+                            "travado contra uma borda real do NavMesh (buraco, geometria) na direção que o " +
+                            "corredor/flow field está mandando, ou um gargalo de avoidance sem saída. Não é " +
+                            "necessariamente um bug (pode ser um obstáculo genuíno) — ative Draw Status Gizmos " +
+                            "pra ver onde ele está e investigue a área/o destino que ele recebeu.",
+                            agentComponents[i]);
+                        break;
                 }
             }
         }
@@ -1786,6 +1818,10 @@ namespace CustomNavMesh
                     WallSafeBfsHops = wallSafeBfsHops,
                     ExternalMoveTolerance = externalMoveTolerance,
                     MovementFault = movementFault,
+                    NoProgressTime = noProgressTime,
+                    NoProgressThresholdSeconds = noProgressThresholdSeconds,
+                    NoProgressMinIntendedSpeedFraction = noProgressMinIntendedSpeedFraction,
+                    NoProgressMinProgressFraction = noProgressMinProgressFraction,
                     FlowFieldIgnoresAvoidance = flowFieldIgnoresAvoidance,
                     Paused = paused,
                     IgnoreAvoidance = ignoreAvoidance,

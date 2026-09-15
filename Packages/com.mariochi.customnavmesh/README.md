@@ -561,6 +561,29 @@ script está escrevendo `transform.position` do agente diretamente em vez de usa
 `SetVelocityOverride`/`Warp()` — vale caçar esse código, porque ele está brigando com o
 Job por controle da posição a cada frame.
 
+### Híbrido com NavMeshAgent nativo
+
+O mecanismo acima também permite um esquema deliberado, não só o caso acidental: manter o
+`CustomNavMeshAgent` registrado só pra **decidir** corredor/flow field/velocidade
+(`Velocity`, `HasReachedEnd` etc.), e delegar o **movimento de fato** pra um
+`UnityEngine.AI.NavMeshAgent` nativo no mesmo GameObject, com `isStopped = true` (desliga a
+busca de path própria dele) chamando `nativeAgent.Move(velocity * Time.deltaTime)` a cada
+frame — útil se o clamp nativo da Unity (`NavMesh.SamplePosition` por baixo do `Move()`)
+lidar melhor com uma geometria específica que este pacote ainda não trata bem (ex.: um
+trecho com triângulos-sliver, ver "Triângulos degenerados" acima). `nativeAgent.Move()`
+escreve o Transform, `AvoidanceAndMoveJob` detecta a divergência no próximo frame (via
+`External Move Tolerance`, ver acima) e realinha corredor/flow field/`CurrentTriangle` em
+cima de onde o `NavMeshAgent` nativo realmente deixou o agente — sem precisar de nenhuma
+flag nova, é o mesmo mecanismo de adoção de posição externa.
+
+Diferença importante desse uso em relação ao caso normal (knockback pontual, raro): aqui a
+"posição externa" diverge **todo frame**, pra **todo agente** no esquema — deixou de ser
+evento raro pra virar hot path. Por isso a adoção usa a mesma cascata barata-pra-cara do
+`ClampToNavMesh` (cache+vizinhos → BFS limitado → busca irrestrita no grid inteiro, ver
+`ReconnectToNavMesh` em `AvoidanceAndMoveJob`) em vez de pular direto pra busca irrestrita
+— sem isso, esse esquema pagaria a camada mais cara do clamp pra cada agente em todo frame,
+um gargalo pior que o de avoidance que ele estaria tentando evitar.
+
 ## Arquitetura
 
 ```

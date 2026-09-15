@@ -252,7 +252,12 @@ namespace CustomNavMesh
             if (math.distancesq(actualTransformPos, expectedTransformPos) > toleranceSq)
             {
                 float3 externalPos = actualTransformPos - new float3(0f, Heights[index], 0f);
-                int externalTri = NavMeshQueryUtil.FindNearestTriangle(externalPos, TriGrid, NavVertices, NavTriangles, out float3 clampedExternal);
+                // mesma cascata barata-pra-cara do ClampToNavMesh (ver ReconnectToNavMesh) —
+                // sem isso, esse branch sempre pagava a busca irrestrita no grid inteiro
+                // (camada 3), o que fica caro quando "posição externa" não é mais um evento
+                // raro de knockback, mas o hot path de um NavMeshAgent nativo movendo o
+                // Transform todo frame (ver comentário grande em ReconnectToNavMesh).
+                int externalTri = ReconnectToNavMesh(CurrentTriangle[index], externalPos, out float3 clampedExternal);
                 if (externalTri >= 0)
                 {
                     pos = clampedExternal;
@@ -863,38 +868,11 @@ namespace CustomNavMesh
         {
             if (duringLinkJump) return newPos;
 
-            int tri = CurrentTriangle[index];
-            float threshold = NeighborQueryRadius * NeighborQueryRadius + 1f;
-
-            if (tri >= 0 && tri < NavTriangles.Length)
+            int found = ReconnectToNavMesh(CurrentTriangle[index], newPos, out float3 cp);
+            if (found >= 0)
             {
-                int found = TestTriangleAndNeighbors(tri, newPos, TriangleStickyMargin, out float3 cp, out float d2);
-                if (found >= 0 && d2 <= threshold)
-                {
-                    CurrentTriangle[index] = found;
-                    return cp;
-                }
-
-                // camada 2: BFS por adjacência real, bem mais permissivo em alcance que o
-                // 1-anel acima mas ainda incapaz de atravessar uma parede (não existe
-                // NavNeighbors através de uma fronteira sem conexão real na malha).
-                if (WallSafeBfsHops > 0)
-                {
-                    int foundBfs = TestTriangleBFS(tri, newPos, WallSafeBfsHops, out float3 cpBfs, out float d2Bfs);
-                    if (foundBfs >= 0 && d2Bfs <= threshold)
-                    {
-                        CurrentTriangle[index] = foundBfs;
-                        return cpBfs;
-                    }
-                }
-            }
-
-            // camada 3: última linha, sem garantia de respeitar adjacência — ver comentário acima.
-            int nearest = NavMeshQueryUtil.FindNearestTriangle(newPos, TriGrid, NavVertices, NavTriangles, out float3 cp2);
-            if (nearest >= 0)
-            {
-                CurrentTriangle[index] = nearest;
-                return cp2;
+                CurrentTriangle[index] = found;
+                return cp;
             }
 
             // não achou NENHUM triângulo — nem no cache+vizinhos, nem no BFS, nem na busca
@@ -905,6 +883,55 @@ namespace CustomNavMesh
             // frames, é um agente genuinamente preso fora do NavMesh, não um solavanco de 1 frame.
             MovementFault[index] = (byte)MovementFaultType.LostNavMesh;
             return safePos;
+        }
+
+        /// <summary>
+        /// A mesma cascata de 3 camadas documentada acima (cache+vizinhos → BFS limitado →
+        /// busca irrestrita), extraída pra ser reaproveitada tanto por ClampToNavMesh quanto
+        /// pelo branch de "posição externa adotada" logo no início de Execute() — sem isso,
+        /// esse segundo branch sempre pagava direto o custo da camada 3 (FindNearestTriangle,
+        /// busca irrestrita no grid inteiro), mesmo quando a posição externa só andou um
+        /// pouco dentro da mesma vizinhança. Isso era barato enquanto "posição externa" era
+        /// um evento raro (knockback pontual), mas vira HOT PATH — camada 3 rodando pra TODO
+        /// agente TODO frame — em integrações que usam um NavMeshAgent nativo (isStopped=true,
+        /// Move() manual) pra mover o Transform guiado pela velocidade que este pacote calcula
+        /// (ver README, "Híbrido com NavMeshAgent nativo"): com poucos agentes não se nota,
+        /// mas em dezenas/centenas vira um gargalo pior que o de avoidance que esse esquema
+        /// tentava evitar. Devolve -1 se nem a busca irrestrita achar nada (fora da área
+        /// coberta pelo NavMesh) — quem chama decide o fallback (ClampToNavMesh usa safePos +
+        /// LostNavMesh; a adoção de posição externa simplesmente ignora e mantém a simulação
+        /// normal, ver Execute()).
+        /// </summary>
+        int ReconnectToNavMesh(int seedTri, float3 p, out float3 closest)
+        {
+            float threshold = NeighborQueryRadius * NeighborQueryRadius + 1f;
+
+            if (seedTri >= 0 && seedTri < NavTriangles.Length)
+            {
+                int found = TestTriangleAndNeighbors(seedTri, p, TriangleStickyMargin, out float3 cp, out float d2);
+                if (found >= 0 && d2 <= threshold)
+                {
+                    closest = cp;
+                    return found;
+                }
+
+                // camada 2: BFS por adjacência real, bem mais permissivo em alcance que o
+                // 1-anel acima mas ainda incapaz de atravessar uma parede (não existe
+                // NavNeighbors através de uma fronteira sem conexão real na malha).
+                if (WallSafeBfsHops > 0)
+                {
+                    int foundBfs = TestTriangleBFS(seedTri, p, WallSafeBfsHops, out float3 cpBfs, out float d2Bfs);
+                    if (foundBfs >= 0 && d2Bfs <= threshold)
+                    {
+                        closest = cpBfs;
+                        return foundBfs;
+                    }
+                }
+            }
+
+            // camada 3: última linha, sem garantia de respeitar adjacência — ver comentário
+            // grande em ClampToNavMesh pro porquê disso ser aceito como último recurso.
+            return NavMeshQueryUtil.FindNearestTriangle(p, TriGrid, NavVertices, NavTriangles, out closest);
         }
 
         /// <summary>

@@ -576,6 +576,22 @@ escreve o Transform, `AvoidanceAndMoveJob` detecta a divergência no próximo fr
 cima de onde o `NavMeshAgent` nativo realmente deixou o agente — sem precisar de nenhuma
 flag nova, é o mesmo mecanismo de adoção de posição externa.
 
+Pra esse esquema não depender de você lembrar de adicionar o componente nativo (e arriscar
+`NullReferenceException` num `GetComponent<NavMeshAgent>()` que falha), `CustomNavMeshAgent`
+tem `[RequireComponent(typeof(NavMeshAgent))]` — Unity garante que o componente sempre
+existe no mesmo GameObject, exposto em `CustomNavMeshAgent.NativeAgent`. Ele vem
+**desabilitado por padrão** (`OnEnable` faz `NativeAgent.enabled = false`) — a maioria dos
+projetos não usa o híbrido, e um `NavMeshAgent` nativo ligado tentaria buscar path e se
+ajustar sozinho ao NavMesh por conta própria, brigando pelo Transform com o Job deste
+pacote. Pra usar o híbrido, reabilite e configure explicitamente antes de chamar `Move()`:
+
+```csharp
+customAgent.NativeAgent.enabled = true;
+customAgent.NativeAgent.isStopped = true; // nunca deixa ele buscar path sozinho
+// a cada frame:
+customAgent.NativeAgent.Move(customAgent.Velocity * Time.deltaTime);
+```
+
 Diferença importante desse uso em relação ao caso normal (knockback pontual, raro): aqui a
 "posição externa" diverge **todo frame**, pra **todo agente** no esquema — deixou de ser
 evento raro pra virar hot path. Por isso a adoção usa a mesma cascata barata-pra-cara do

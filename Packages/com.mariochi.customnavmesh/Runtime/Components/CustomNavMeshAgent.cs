@@ -1,5 +1,6 @@
 using Unity.Mathematics;
 using UnityEngine;
+using UnityEngine.AI;
 
 namespace CustomNavMesh
 {
@@ -8,8 +9,21 @@ namespace CustomNavMesh
     /// "handle" que registra o Transform no NavMeshJobManager e expõe destino/velocidade/
     /// status. Todo o trabalho pesado (pathfinding, avoidance, movimento) acontece em Jobs
     /// dentro do manager — este componente não faz nada em Update.
+    ///
+    /// Exige um UnityEngine.AI.NavMeshAgent no mesmo GameObject (`RequireComponent`) — não
+    /// pra usar a API dele (o pipeline normal continua 100% independente, sem tocar nele
+    /// em nada), mas pra viabilizar o esquema "híbrido" documentado no README (seção
+    /// "Híbrido com NavMeshAgent nativo"): delegar o movimento de fato pro `Move()` do
+    /// componente nativo, guiado pela velocidade que este pacote calcula, garantindo que
+    /// `GetComponent&lt;NavMeshAgent&gt;()` nunca retorne null nesse esquema. Pra não afetar
+    /// quem NÃO usa o híbrido (a maioria), o componente nativo é desabilitado por padrão em
+    /// OnEnable (ver NativeAgent) — sem isso, ele tentaria fazer a própria coisa (buscar
+    /// path, se ajustar sozinho ao NavMesh no Awake dele) brigando pelo Transform com o Job
+    /// deste pacote. Quem quiser o híbrido reabilita e configura explicitamente
+    /// (`NativeAgent.enabled = true; NativeAgent.isStopped = true;`) antes de chamar Move().
     /// </summary>
     [DisallowMultipleComponent]
+    [RequireComponent(typeof(NavMeshAgent))]
     public class CustomNavMeshAgent : MonoBehaviour
     {
         [SerializeField] float radius = 0.5f;
@@ -153,6 +167,14 @@ namespace CustomNavMesh
             avoidanceYieldWeight = math.max(1e-4f, avoidanceYieldWeight);
         }
 
+        /// <summary>
+        /// O UnityEngine.AI.NavMeshAgent exigido no mesmo GameObject (ver RequireComponent na
+        /// classe) — desabilitado por padrão (ver OnEnable) pra não brigar pelo Transform com
+        /// este pacote. Só existe pra viabilizar o esquema "híbrido" (README, "Híbrido com
+        /// NavMeshAgent nativo"); o pipeline normal deste pacote nunca toca nele.
+        /// </summary>
+        public NavMeshAgent NativeAgent { get; private set; }
+
         void OnEnable()
         {
             if (Manager == null)
@@ -163,6 +185,24 @@ namespace CustomNavMesh
                 enabled = false;
                 return;
             }
+
+            // desabilitado por padrão: o NavMeshAgent nativo só existe aqui (RequireComponent)
+            // pra viabilizar o esquema híbrido opcional (ver doc da classe/README) — deixado
+            // ligado, ele tentaria buscar path e se ajustar sozinho ao NavMesh por conta
+            // própria, brigando pelo Transform com o Job deste pacote. Quem quiser o híbrido
+            // reabilita explicitamente (NativeAgent.enabled = true) e configura isStopped
+            // antes de chamar Move().
+            //
+            // GetComponent (não AddComponent) porque RequireComponent já deveria garantir a
+            // existência — mas só pra quem ADICIONA CustomNavMeshAgent pelo Editor DAQUI EM
+            // DIANTE; um GameObject/prefab salvo ANTES desta versão (com CustomNavMeshAgent
+            // mas sem NavMeshAgent) não ganha o componente retroativamente só por recompilar.
+            // AddComponent como rede de segurança evita NullReferenceException nesse caso —
+            // sem isso, o próprio propósito do RequireComponent (nunca dar null aqui) falharia
+            // silenciosamente pra qualquer prefab mais antigo que o pacote.
+            NativeAgent = GetComponent<NavMeshAgent>();
+            if (NativeAgent == null) NativeAgent = gameObject.AddComponent<NavMeshAgent>();
+            NativeAgent.enabled = false;
 
             AgentIndex = Manager.RegisterAgent(this);
             if (AgentIndex < 0) enabled = false;

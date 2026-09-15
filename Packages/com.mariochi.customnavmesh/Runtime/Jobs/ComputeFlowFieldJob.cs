@@ -33,6 +33,22 @@ namespace CustomNavMesh
     /// Custo: Dijkstra sobre o grafo INTEIRO alcançável a partir do alvo, não só até o
     /// agente mais próximo — ou seja, o custo não cai mesmo se só 1 agente usar o campo.
     /// Só compensa sobre FindPathsBatchJob quando VÁRIOS agentes convergem pro mesmo ponto.
+    ///
+    /// NavMeshLink: o Dijkstra também atravessa as arestas extras de NavMeshLink (mesmas
+    /// que FindPathsBatchJob usa no A* individual — ver NavMeshGraph.LinkStart/...), no
+    /// sentido inverso da travessia real (aqui expandimos do alvo pra fora). Sem isso,
+    /// qualquer grupo cujo caminho mais curto precisasse atravessar um link (portão
+    /// levadiço, ponte, rampa) nunca alcançava esse lado do grafo pelo flow field —
+    /// DistanceOut ficava float.MaxValue pra sempre mesmo com o pathfinding individual
+    /// achando caminho normalmente pro mesmo par de pontos (o A* individual usa links; o
+    /// Dijkstra antes desta correção não usava). O triângulo de PARTIDA de cada link usado
+    /// tem sua direção de fluxo apontando direto pro LinkStart (ver LinkOut), não pro
+    /// gradiente de vértice normal — não existe aresta/vértice compartilhado do outro lado
+    /// de um link pra interpolar. Mesmo assim, o flow field NÃO sabe atravessar o vão do
+    /// link sozinho (isso é exclusivo do pipeline individual/corredor — ver
+    /// AvoidanceAndMoveJob e NavMeshJobManager.CheckFlowFieldArrivals); LinkOut é o sinal
+    /// que o chamador usa pra promover o agente pro pipeline individual assim que ele
+    /// chega nesse triângulo de partida, não só perto do alvo final.
     /// </summary>
     [BurstCompile]
     public struct ComputeFlowFieldJob : IJob
@@ -43,6 +59,15 @@ namespace CustomNavMesh
         [ReadOnly] public NativeArray<byte> TriangleArea;
         [ReadOnly] public NativeArray<int3> Triangles;
         [ReadOnly] public NativeArray<float3> Vertices;
+
+        // --- off-mesh links (NavMeshLink) — mesmas arestas extras que FindPathsBatchJob usa
+        // no A* individual (ver NavMeshGraph.LinkStart/... e comentário grande abaixo, no
+        // laço de Dijkstra). Arrays de tamanho 0 quando a cena não tem nenhum link.
+        [ReadOnly] public NativeArray<float3> LinkStart;
+        [ReadOnly] public NativeArray<int> LinkFromTriangle;
+        [ReadOnly] public NativeArray<int> LinkToTriangle;
+        [ReadOnly] public NativeArray<float> LinkCost;
+        [ReadOnly] public NativeArray<byte> LinkArea;
 
         public int TargetTriangle;
         public int SlotOffset;
@@ -63,6 +88,16 @@ namespace CustomNavMesh
 
         public NativeArray<float3> DirectionsOut; // tamanho maxFlowFields * nº de triângulos
         public NativeArray<float> DistanceOut;
+        /// <summary>
+        /// Flat (mesmo layout de DistanceOut): índice do NavMeshLink que a rota ótima DESTE
+        /// triângulo usa pra continuar em direção ao alvo, ou -1 se não precisa de nenhum. O
+        /// flow field não sabe atravessar o vão de um link sozinho (não tem noção de "salto" —
+        /// isso é exclusivo do pipeline individual/corredor, ver AvoidanceAndMoveJob); é essa
+        /// saída que permite ao chamador (NavMeshJobManager.CheckFlowFieldArrivals) promover o
+        /// agente pro pipeline individual assim que ele chega no triângulo de partida de um
+        /// link — não só perto do alvo final, como já acontecia antes desta saída existir.
+        /// </summary>
+        public NativeArray<int> LinkOut;
 
         public void Execute()
         {
@@ -71,6 +106,7 @@ namespace CustomNavMesh
             {
                 DistanceOut[SlotOffset + i] = float.MaxValue;
                 DirectionsOut[SlotOffset + i] = float3.zero;
+                LinkOut[SlotOffset + i] = -1;
             }
 
             if (TargetTriangle < 0 || TargetTriangle >= n) return;
@@ -78,6 +114,20 @@ namespace CustomNavMesh
             // ---- Dijkstra sobre os triângulos (distância-até-o-alvo por triângulo) ----
             var closed = new NativeArray<bool>(n, Allocator.Temp);
             var heap = new NativeMinHeap(64, Allocator.Temp);
+
+            // LinkOut[SlotOffset+t] = índice do NavMeshLink usado pra alcançar 'current' → 't'
+            // na relaxação que deu a MELHOR distância conhecida de 't' até agora, ou -1 se a
+            // melhor rota veio por adjacência normal de malha. Só importa pro triângulo que
+            // fica do lado de PARTIDA do link (t == LinkFromTriangle[LinkOut[SlotOffset+t]]): a
+            // direção de fluxo dele não pode vir do gradiente de vértice normal (não existe
+            // aresta/vértice compartilhado do outro lado de um link — é um salto no vazio),
+            // então DirectionsOut[t] aponta direto pro LinkStart do link (ver mais abaixo,
+            // depois do laço de gradiente) — mesma ideia de "portal" que FallbackPortalDirection
+            // já usa pra vizinhos de malha, só que com o ponto exato do link em vez do meio
+            // da aresta compartilhada (não existe aresta aqui). É saída persistente (não só
+            // local) pra NavMeshJobManager.CheckFlowFieldArrivals poder promover o agente pro
+            // pipeline individual assim que ele chega nesse triângulo de partida — o flow field
+            // não sabe atravessar o vão do link sozinho.
 
             DistanceOut[SlotOffset + TargetTriangle] = 0f;
             heap.Push(TargetTriangle, 0f);
@@ -104,6 +154,35 @@ namespace CustomNavMesh
                     if (tentative < DistanceOut[SlotOffset + nb])
                     {
                         DistanceOut[SlotOffset + nb] = tentative;
+                        LinkOut[SlotOffset + nb] = -1; // chegou por adjacência normal — sobrescreve um link mais caro, se houver
+                        heap.Push(nb, tentative);
+                    }
+                }
+
+                // arestas extras de NavMeshLink que TERMINAM em 'current' (LinkToTriangle[lk]
+                // == current): num agente andando de verdade (start → alvo), essa é a mesma
+                // travessia que FindPathsBatchJob já considera (LinkFromTriangle[lk] →
+                // LinkToTriangle[lk]) — aqui, expandindo do alvo pra fora, olhamos pro sentido
+                // oposto, então quem relaxa é o lado de PARTIDA (nb = LinkFromTriangle[lk]).
+                // Sem isso, qualquer grupo cujo caminho mais curto precise atravessar um link
+                // (portão levadiço, ponte, rampa modelada como NavMeshLink) nunca alcança esse
+                // lado do grafo pelo flow field — DistanceOut fica float.MaxValue pra sempre
+                // mesmo com o pathfinding individual (que usa links) achando caminho normalmente
+                // pro mesmo par de pontos. Varredura linear sobre todos os links da cena, mesmo
+                // custo/escala que FindPathsBatchJob já paga (tipicamente dezenas, não milhares).
+                for (int lk = 0; lk < LinkToTriangle.Length; lk++)
+                {
+                    if (LinkToTriangle[lk] != current) continue;
+
+                    int nb = LinkFromTriangle[lk];
+                    if (nb < 0 || closed[nb]) continue;
+                    if (!NavMeshQueryUtil.IsAreaAllowed(LinkArea[lk], AreaMask)) continue;
+
+                    float tentative = DistanceOut[SlotOffset + current] + LinkCost[lk];
+                    if (tentative < DistanceOut[SlotOffset + nb])
+                    {
+                        DistanceOut[SlotOffset + nb] = tentative;
+                        LinkOut[SlotOffset + nb] = lk;
                         heap.Push(nb, tentative);
                     }
                 }
@@ -133,6 +212,17 @@ namespace CustomNavMesh
             {
                 float dCenter = DistanceOut[SlotOffset + t];
                 if (t == TargetTriangle || dCenter >= float.MaxValue) continue;
+
+                // triângulo cuja rota ótima atravessa um NavMeshLink por aqui — não tem aresta/
+                // vértice compartilhado com o outro lado do link pra interpolar gradiente
+                // nenhum, então aponta direto pro ponto de partida do link (mesma ideia do
+                // "salto reto" que FindPathsBatchJob já usa no corredor individual).
+                int linkIdx = LinkOut[SlotOffset + t];
+                if (linkIdx >= 0)
+                {
+                    DirectionsOut[SlotOffset + t] = math.normalizesafe(LinkStart[linkIdx] - Centers[t]);
+                    continue;
+                }
 
                 int3 tri = Triangles[t];
                 float d0 = vertexDistance[tri.x];
@@ -217,9 +307,13 @@ namespace CustomNavMesh
                 {
                     float dCenter = DistanceOut[SlotOffset + t];
                     float3 own = DirectionsOut[SlotOffset + t];
-                    if (t == TargetTriangle || dCenter >= float.MaxValue || math.all(own == float3.zero))
+                    if (t == TargetTriangle || dCenter >= float.MaxValue || math.all(own == float3.zero) || LinkOut[SlotOffset + t] >= 0)
                     {
-                        buffer[t] = own; // fora de alcance ou é o próprio alvo — não participa do blur
+                        // fora de alcance, é o próprio alvo, ou aponta pro ponto exato de partida
+                        // de um NavMeshLink — nesse último caso a direção já é um "portal" preciso
+                        // (ver Execute()); misturar com vizinhos de MALHA (que não sabem nada sobre
+                        // o link) só desviaria o agente de entrar de fato no ponto de salto.
+                        buffer[t] = own;
                         continue;
                     }
 

@@ -281,6 +281,8 @@ namespace CustomNavMesh
         NativeArray<int> flowFieldSlot; // -1 = agente no modo corredor
         NativeArray<float3> flowFieldDirections; // flat: slot * graph.TriangleCount + triângulo
         NativeArray<float> flowFieldDistance;
+        /// <summary>Flat, mesmo layout de flowFieldDistance: índice do NavMeshLink que a rota ótima daquele triângulo usa pra continuar (-1 = nenhum) — ver ComputeFlowFieldJob.LinkOut e CheckFlowFieldArrivals.</summary>
+        NativeArray<int> flowFieldLinkTriangle;
         NativeArray<float3> flowFieldTargetPoints; // por slot (tamanho maxFlowFields) — ponto "bruto" do comando, sem formação
         NativeArray<float3> flowFieldPersonalTarget; // por agente — ponto que ele mira de fato perto do alvo (com offset de formação, se houver)
         FlowFieldMeta[] flowFieldMeta; // bookkeeping gerenciado, pequeno, não precisa ser NativeArray
@@ -726,11 +728,13 @@ namespace CustomNavMesh
             // não valem mais nada), então libera todo mundo que estava usando algum.
             if (flowFieldDirections.IsCreated) flowFieldDirections.Dispose();
             if (flowFieldDistance.IsCreated) flowFieldDistance.Dispose();
+            if (flowFieldLinkTriangle.IsCreated) flowFieldLinkTriangle.Dispose();
 
             int ffCapacity = math.max(1, maxFlowFields);
             int flatSize = math.max(1, ffCapacity * graph.TriangleCount);
             flowFieldDirections = new NativeArray<float3>(flatSize, Allocator.Persistent);
             flowFieldDistance = new NativeArray<float>(flatSize, Allocator.Persistent);
+            flowFieldLinkTriangle = new NativeArray<int>(flatSize, Allocator.Persistent);
 
             for (int i = 0; i < flowFieldMeta.Length; i++)
                 flowFieldMeta[i] = default; // InUse = false
@@ -860,6 +864,7 @@ namespace CustomNavMesh
             if (flowFieldPersonalTarget.IsCreated) flowFieldPersonalTarget.Dispose();
             if (flowFieldDirections.IsCreated) flowFieldDirections.Dispose();
             if (flowFieldDistance.IsCreated) flowFieldDistance.Dispose();
+            if (flowFieldLinkTriangle.IsCreated) flowFieldLinkTriangle.Dispose();
             if (flowFieldTargetPoints.IsCreated) flowFieldTargetPoints.Dispose();
             if (agentSpatialHash.IsCreated) agentSpatialHash.Dispose();
             if (obstaclePositions.IsCreated) obstaclePositions.Dispose();
@@ -1332,12 +1337,18 @@ namespace CustomNavMesh
                 TriangleArea = graph.TriangleArea,
                 Triangles = graph.Triangles,
                 Vertices = graph.Vertices,
+                LinkStart = graph.LinkStart,
+                LinkFromTriangle = graph.LinkFromTriangle,
+                LinkToTriangle = graph.LinkToTriangle,
+                LinkCost = graph.LinkCost,
+                LinkArea = graph.LinkArea,
                 TargetTriangle = targetTriangle,
                 SlotOffset = slot * graph.TriangleCount,
                 AreaMask = areaMask,
                 DirectionSmoothingIterations = flowFieldDirectionSmoothingIterations,
                 DirectionsOut = flowFieldDirections,
                 DistanceOut = flowFieldDistance,
+                LinkOut = flowFieldLinkTriangle,
             }.Schedule().Complete();
 
             // --- 1ª passada: centróide e velocidade média do grupo (só agentes válidos) ---
@@ -1642,9 +1653,16 @@ namespace CustomNavMesh
 
         /// <summary>
         /// Promove agentes em flow field pro pipeline individual (SetDestination) assim que
-        /// entram no raio de Flow Field Arrive Distance. O flow field compartilhado cuida do
-        /// trajeto longo em grupo (barato — um cálculo serve pra todo mundo); a reta final usa
-        /// o mesmo A* + funnel do modo individual (já validado sem zigue-zague) até o ponto
+        /// entram no raio de Flow Field Arrive Distance, OU assim que a rota ótima do
+        /// triângulo em que estão precisa atravessar um NavMeshLink pra continuar (ver
+        /// ComputeFlowFieldJob.LinkOut) — o flow field não sabe atravessar o vão de um link
+        /// sozinho (não tem noção de "salto", isso é exclusivo do pipeline individual/corredor,
+        /// ver AvoidanceAndMoveJob), então sem essa segunda checagem o agente ficaria andando
+        /// pro ponto de partida do link e parado bem na borda da malha pra sempre, mesmo já
+        /// sabendo (via LinkOut) que precisa saltar ali. O flow field compartilhado cuida do
+        /// trajeto longo em grupo (barato — um cálculo serve pra todo mundo); a partir da
+        /// promoção (perto do alvo OU perto de um link) usa o mesmo A* + funnel do modo
+        /// individual (já validado sem zigue-zague, com suporte a salto de link) até o ponto
         /// exato de chegada, respeitando a malha, em vez de uma linha reta ingênua até o ponto
         /// de formação. Só chama SetDestination — todo o resto (liberar o slot do campo,
         /// enfileirar o repath) já é tratado por CollectRepathRequests logo em seguida.
@@ -1659,8 +1677,10 @@ namespace CustomNavMesh
                 int tri = currentTriangle[i];
                 if (tri < 0) continue;
 
-                float dist = flowFieldDistance[slot * graph.TriangleCount + tri];
-                if (dist <= flowFieldArriveDistance)
+                int offset = slot * graph.TriangleCount + tri;
+                float dist = flowFieldDistance[offset];
+                bool needsLink = flowFieldLinkTriangle[offset] >= 0;
+                if (dist <= flowFieldArriveDistance || needsLink)
                     agentComponents[i].SetDestination(flowFieldPersonalTarget[i]);
             }
         }

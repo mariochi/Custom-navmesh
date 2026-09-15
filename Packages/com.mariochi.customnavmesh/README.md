@@ -436,11 +436,13 @@ um vão) em vez de atravessar o espaço vazio em linha reta até o ponto de pous
   mesmo link ao mesmo tempo ainda tentam se desviar um do outro via ORCA, o que não faz
   muito sentido fisicamente no ar; simplificação deliberada (evitar isso exigiria mais um
   flag e mais complexidade por um caso de borda raro).
-- **Flow field (`MoveGroupWithFlowField`) NÃO usa links** — o Dijkstra de
-  `ComputeFlowFieldJob` só considera a adjacência normal entre triângulos. Um grupo que
-  precisa atravessar um link deve ser individual (`SetDestination`) nesse trecho, ou
-  promovido do flow field pro pipeline individual perto do link (mesmo mecanismo de
-  `Flow Field Arrive Distance` já usado pra chegada).
+- ~~**Flow field (`MoveGroupWithFlowField`) NÃO usa links.**~~ Resolvido: o Dijkstra de
+  `ComputeFlowFieldJob` agora atravessa as mesmas arestas de `NavMeshLink` que o A*
+  individual (`FindPathsBatchJob`) usa — um grupo cujo caminho mais curto precisa passar
+  por um portão levadiço/ponte/rampa modelado como link não fica mais "inalcançável"
+  (`RemainingDistance` infinito) até a promoção pro pipeline individual perto do alvo. O
+  triângulo de onde o link parte aponta direto pro ponto exato de partida (não tem
+  aresta/vértice compartilhado do outro lado de um link pra interpolar gradiente normal).
 - **`GetIsOnNavMesh()` continua `true` durante o salto** (o `CurrentTriangle` fica
   congelado no triângulo de partida) — é uma simplificação deliberada: o agente está
   numa travessia sancionada, não "perdido" (ver `MovementFaultType.LostNavMesh`, que é

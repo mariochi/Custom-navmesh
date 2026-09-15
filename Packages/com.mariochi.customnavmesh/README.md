@@ -765,6 +765,27 @@ de calibração pra esse tamanho de mapa é o **broad-phase**, não o pathfindin
   vizinhas (janela 3x3x3) antes de decidir que um vértice é novo, com uma checagem de
   distância real (não só a célula) antes de fundir — elimina esse falso-negativo
   independente de onde a coincidência cai em relação à grade.
+- **Triângulos degenerados (sliver) — `Min Triangle Area`.** Bakes do Recast em geometria
+  de parede complexa/detalhada demais pro `Voxel Size` usado ali costumam gerar uma "teia"
+  de triângulos degenerados: faixas extremamente finas e alongadas cobrindo uma fronteira
+  que, na resolução do voxel, quase colapsa numa linha (visível no `Draw NavMesh Gizmo`
+  como uma bagunça de triângulos cruzando em todo canto perto da parede, em vez de uma
+  malha limpa). Isso confunde tanto `Funnel.cs` (decide left/right em cima da ÁREA do
+  portal — um portal quase-zero some no ruído de ponto flutuante, produzindo um waypoint
+  que visualmente "atravessa" a parede) quanto `AvoidanceAndMoveJob.TestTriangleAndNeighbors`
+  (fica alternando entre slivers vizinhos quase empatados) — na prática aparece como
+  `MovementFaultType.NoProgress` perto dessa geometria. A causa raiz é qualidade de bake
+  (considere simplificar o collider da parede nesse trecho por um box simples, ou usar um
+  `Voxel Size` menor só localmente via `NavMeshModifierVolume`), mas `RebuildGraph()` já
+  aplica uma rede de segurança: descarta do grafo, ANTES de montar a adjacência, qualquer
+  triângulo com área REAL em 3D (não projetada em XZ — uma rampa/degrau estreito de
+  propósito continua com área 3D normal mesmo com pegada XZ pequena, então não é
+  descartado por engano) abaixo de `Min Triangle Area` (default `1e-4`m², pequeno o
+  bastante pra só pegar degenerados de verdade). O `Debug.LogWarning` do `RebuildGraph()`
+  avisa quantos triângulos foram descartados; `0` ou negativo desliga o filtro
+  (comportamento antigo). Risco aceito ao subir o valor: se um sliver for a ÚNICA ponte
+  entre duas regiões (nenhum triângulo saudável cobrindo o mesmo trecho), removê-lo pode
+  desconectá-las — suba com cautela e confira `Draw NavMesh Gizmo`/`NoPath` depois de mudar.
 
 ## Limitações conhecidas / pontos de atenção
 

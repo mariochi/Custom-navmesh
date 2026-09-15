@@ -31,7 +31,16 @@ namespace CustomNavMesh
         /// </summary>
         public const float DefaultWeldEpsilon = 0.01f;
 
-        public static NavMeshGraph BuildFromUnityNavMesh(Allocator allocator, float weldEpsilon = DefaultWeldEpsilon)
+        /// <summary>
+        /// Área mínima (m², triângulo REAL em 3D — não projetado em XZ) abaixo da qual um
+        /// triângulo é descartado do grafo por padrão — ver parâmetro 'minTriangleArea' de
+        /// BuildFromUnityNavMesh e o comentário grande lá. Pequeno o bastante pra só pegar
+        /// slivers genuinamente degenerados (ruído de voxelização), não geometria real fina
+        /// de propósito (rampa estreita, beirada de escada).
+        /// </summary>
+        public const float DefaultMinTriangleArea = 1e-4f;
+
+        public static NavMeshGraph BuildFromUnityNavMesh(Allocator allocator, float weldEpsilon = DefaultWeldEpsilon, float minTriangleArea = DefaultMinTriangleArea)
         {
             NavMeshTriangulation tri = NavMesh.CalculateTriangulation();
 
@@ -47,25 +56,82 @@ namespace CustomNavMesh
             }
 
             int vCount = weldedVertices.Count;
-            int tCount = tri.indices.Length / 3;
+            int rawTCount = tri.indices.Length / 3;
 
             var vertices = new NativeArray<float3>(vCount, allocator);
             for (int i = 0; i < vCount; i++)
                 vertices[i] = weldedVertices[i];
 
+            // ---- filtro de triângulos-sliver ----
+            // Bakes do Recast em geometria de parede complexa/detalhada (relativo ao Voxel
+            // Size usado) costumam gerar uma "teia" de triângulos degenerados: faixas
+            // extremamente finas e alongadas tentando cobrir uma fronteira que, na resolução
+            // do voxel, quase colapsa numa linha. Isso confunde tanto o funil (Funnel.cs,
+            // que decide left/right em cima da ÁREA do portal — um portal quase-zero some no
+            // ruído de ponto flutuante) quanto o clamp de superfície
+            // (AvoidanceAndMoveJob.TestTriangleAndNeighbors, que fica alternando entre
+            // slivers vizinhos quase empatados) — na prática aparece como corredor
+            // "atravessando" uma parede fina e/ou agente pinado numa borda sem progredir
+            // (MovementFaultType.NoProgress). A causa raiz é qualidade de bake (ver README,
+            // "Triângulos degenerados (sliver)"), mas descartar esses triângulos do grafo
+            // ANTES de montar a adjacência é uma rede de segurança do pacote: eles nunca
+            // aparecem pro A*/funil/flow field nem pro clamp. Usa a área REAL em 3D (não
+            // projetada em XZ) — uma rampa/degrau estreito de propósito continua com área 3D
+            // normal mesmo tendo pegada XZ pequena, então não é descartado por engano.
+            //
+            // Risco aceito: se um sliver for a ÚNICA ponte entre duas regiões (nenhum
+            // triângulo saudável adjacente cobrindo o mesmo trecho), removê-lo pode
+            // desconectar essa área — na prática, slivers de voxelização costumam ser
+            // "excesso" ao lado de triangulação saudável cobrindo o mesmo espaço físico, não
+            // a única rota, mas não há garantia formal disso. minTriangleArea <= 0 desliga o
+            // filtro inteiro (comportamento antigo, nenhum triângulo é descartado).
+            var keptTriangles = new List<int3>(rawTCount);
+            var keptAreas = new List<byte>(rawTCount);
+            int slivers = 0;
+
+            for (int t = 0; t < rawTCount; t++)
+            {
+                int i0 = remap[tri.indices[t * 3 + 0]];
+                int i1 = remap[tri.indices[t * 3 + 1]];
+                int i2 = remap[tri.indices[t * 3 + 2]];
+
+                if (minTriangleArea > 0f)
+                {
+                    float3 e1 = vertices[i1] - vertices[i0];
+                    float3 e2 = vertices[i2] - vertices[i0];
+                    float area = math.length(math.cross(e1, e2)) * 0.5f;
+                    if (area < minTriangleArea)
+                    {
+                        slivers++;
+                        continue;
+                    }
+                }
+
+                keptTriangles.Add(new int3(i0, i1, i2));
+                keptAreas.Add((byte)tri.areas[t]);
+            }
+
+            if (slivers > 0)
+            {
+                Debug.LogWarning($"NavMeshGraphBuilder: {slivers} triângulo(s)-sliver (área 3D < " +
+                    $"{minTriangleArea:G3}m²) descartado(s) do grafo (de {rawTCount} pra {keptTriangles.Count}) " +
+                    "— provável bake com Voxel Size grosso demais pra geometria de parede detalhada nessa " +
+                    "área (ver README, 'Triângulos degenerados (sliver)'). Isso é uma rede de segurança, não " +
+                    "substitui ajustar o bake se o sintoma persistir (corredor cortando parede, agente sem " +
+                    "progresso perto de geometria complexa).");
+            }
+
+            int tCount = keptTriangles.Count;
             var triangles = new NativeArray<int3>(tCount, allocator);
             var triArea = new NativeArray<byte>(tCount, allocator);
             var centers = new NativeArray<float3>(tCount, allocator);
 
             for (int t = 0; t < tCount; t++)
             {
-                int i0 = remap[tri.indices[t * 3 + 0]];
-                int i1 = remap[tri.indices[t * 3 + 1]];
-                int i2 = remap[tri.indices[t * 3 + 2]];
-
-                triangles[t] = new int3(i0, i1, i2);
-                triArea[t] = (byte)tri.areas[t];
-                centers[t] = (vertices[i0] + vertices[i1] + vertices[i2]) / 3f;
+                int3 idx = keptTriangles[t];
+                triangles[t] = idx;
+                triArea[t] = keptAreas[t];
+                centers[t] = (vertices[idx.x] + vertices[idx.y] + vertices[idx.z]) / 3f;
             }
 
             var areaCost = new NativeArray<float>(NavMeshJobConstants.MaxNavMeshAreas, allocator);

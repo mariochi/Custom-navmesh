@@ -84,6 +84,22 @@ namespace CustomNavMesh
             "garante índice de vértice compartilhado na costura entre tiles do NavMesh (comum em mapas " +
             "grandes) — sem soldar, cada tile vira uma ilha isolada e o A* nunca acha caminho entre eles.")]
         [SerializeField] float vertexWeldEpsilon = NavMeshGraphBuilder.DefaultWeldEpsilon;
+        [Tooltip("Área mínima (m², triângulo REAL em 3D, não projetado em XZ) abaixo da qual um " +
+            "triângulo é descartado do grafo ao montar o RebuildGraph() — filtra 'slivers' " +
+            "(triângulos degenerados, faixas finas e alongadas) que bakes do Recast geram em " +
+            "geometria de parede complexa/detalhada demais pro Voxel Size usado ali. Slivers " +
+            "confundem o funil (portal quase-zero some no ruído de ponto flutuante — corredor " +
+            "parece 'atravessar' a parede) e o clamp de superfície (fica alternando entre " +
+            "slivers vizinhos quase empatados — agente sem progresso perto da parede). É uma " +
+            "rede de segurança do pacote, não substitui ajustar o bake se o sintoma persistir " +
+            "(ver README, 'Triângulos degenerados (sliver)'). Pequeno o bastante por padrão pra " +
+            "só pegar degenerados de verdade — não descarta geometria fina de propósito (rampa " +
+            "estreita, beirada de escada), que tem área 3D normal mesmo com pegada XZ pequena. " +
+            "0 ou negativo desliga o filtro (comportamento antigo, nenhum triângulo é " +
+            "descartado). Risco aceito ao subir demais: se um sliver for a ÚNICA ponte entre " +
+            "duas regiões, removê-lo pode desconectá-las — suba com cautela e confira " +
+            "'Draw NavMesh Gizmo' depois de mudar.")]
+        [SerializeField] float minTriangleArea = NavMeshGraphBuilder.DefaultMinTriangleArea;
         [Tooltip("Margem de histerese (metros) que um triângulo vizinho precisa vencer POR, em " +
             "distância, pra substituir o triângulo em cache no clamp de superfície de cada agente " +
             "(ClampToNavMesh). Sem isso, em trechos com triângulos pequenos e muito próximos entre si " +
@@ -666,7 +682,7 @@ namespace CustomNavMesh
             if (graph.IsCreated) graph.Dispose();
             if (triGrid.IsCreated) triGrid.Dispose();
 
-            graph = NavMeshGraphBuilder.BuildFromUnityNavMesh(Allocator.Persistent, vertexWeldEpsilon);
+            graph = NavMeshGraphBuilder.BuildFromUnityNavMesh(Allocator.Persistent, vertexWeldEpsilon, minTriangleArea);
 
             // calibração automática do Triangle Grid Cell Size (ver tooltip do campo): pega o
             // comprimento médio de aresta dos triângulos DESTE grafo e aplica o multiplicador —
@@ -1868,16 +1884,23 @@ namespace CustomNavMesh
             {
                 for (int i = 0; i < count; i++)
                 {
+                    // 'positions[i]' é a posição rente ao CHÃO (base do agente, sem o offset
+                    // de Height — ver comentário grande no topo da classe); uma esfera ali
+                    // fica cravada no pé/chão do modelo em vez de acompanhar o corpo. Um
+                    // cilindro da base (positions[i]) até o topo (positions[i]+Height), igual
+                    // ao gizmo do NavMeshAgent nativo, representa o volume de colisão real do
+                    // agente e não "some" dentro do chão.
                     Gizmos.color = StatusColor((PathStatus)pathStatus[i]);
-                    Gizmos.DrawWireSphere(positions[i] + new float3(0f, 0.15f, 0f), radii[i] * 0.9f);
+                    DrawWireCylinder(positions[i], radii[i], heights[i]);
 
-                    // marcador extra (esfera preta sólida) por cima de qualquer agente com
-                    // MovementFault no frame atual — sobrepõe a cor de status normal, já que
-                    // isso é mais grave/raro (ver LogMovementFaults / MovementFaultType).
+                    // marcador extra (esfera preta sólida, no meio da altura) por cima de
+                    // qualquer agente com MovementFault no frame atual — sobrepõe a cor de
+                    // status normal, já que isso é mais grave/raro (ver LogMovementFaults /
+                    // MovementFaultType).
                     if (movementFault[i] != (byte)MovementFaultType.None)
                     {
                         Gizmos.color = Color.black;
-                        Gizmos.DrawSphere(positions[i] + new float3(0f, 0.15f, 0f), radii[i] * 0.4f);
+                        Gizmos.DrawSphere(positions[i] + new float3(0f, heights[i] * 0.5f, 0f), radii[i] * 0.4f);
                     }
                 }
             }
@@ -1938,6 +1961,36 @@ namespace CustomNavMesh
                     if (flowFieldSlot[i] == flowFieldGizmoSlot)
                         Gizmos.DrawWireSphere(flowFieldPersonalTarget[i], 0.15f);
                 }
+            }
+        }
+
+        /// <summary>
+        /// Cilindro wireframe (círculo na base, círculo no topo, 4 linhas verticais ligando
+        /// os dois) — mesma ideia visual do gizmo do NavMeshAgent nativo, usado pelo status
+        /// gizmo pra representar o volume de colisão do agente (Radius/Height) sem ficar
+        /// "enterrado" no chão (ver comentário em OnDrawGizmos). Gizmos não tem um primitivo
+        /// de cilindro pronto, então é aproximado por segmentos — 16 é preciso o bastante pra
+        /// leitura em Scene view sem pesar no desenho de centenas de agentes.
+        /// </summary>
+        static void DrawWireCylinder(float3 basePos, float radius, float height, int segments = 16)
+        {
+            float3 top = basePos + new float3(0f, height, 0f);
+            float3 prevBase = basePos + new float3(radius, 0f, 0f);
+            float3 prevTop = top + new float3(radius, 0f, 0f);
+
+            for (int s = 1; s <= segments; s++)
+            {
+                float angle = s / (float)segments * 2f * math.PI;
+                float3 offset = new float3(math.cos(angle) * radius, 0f, math.sin(angle) * radius);
+                float3 curBase = basePos + offset;
+                float3 curTop = top + offset;
+
+                Gizmos.DrawLine(prevBase, curBase);
+                Gizmos.DrawLine(prevTop, curTop);
+                if (s % (segments / 4) == 0) Gizmos.DrawLine(curBase, curTop); // 4 verticais, espaçadas
+
+                prevBase = curBase;
+                prevTop = curTop;
             }
         }
 

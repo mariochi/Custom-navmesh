@@ -333,7 +333,7 @@ namespace CustomNavMesh
 
                 int runLen = i - runStart;
                 float3 segEnd = (i == k) ? overallEnd
-                    : ApplyLinkLateralOffset(LinkStart[arrivalLink[i]], LinkStart[arrivalLink[i]], LinkEnd[arrivalLink[i]], LinkWidth[arrivalLink[i]], lateralT);
+                    : ApplyLinkLateralOffset(LinkStart[arrivalLink[i]], LinkStart[arrivalLink[i]], LinkEnd[arrivalLink[i]], LinkWidth[arrivalLink[i]], lateralT, triPath[i - 1]);
 
                 if (runLen == 1)
                 {
@@ -379,7 +379,7 @@ namespace CustomNavMesh
                     // Mesmo deslocamento lateral aplicado nos dois lados (segEnd acima e aqui)
                     // — o agente atravessa numa reta paralela à linha central do link, não
                     // necessariamente NA linha central, então não "desalinha" o salto.
-                    float3 landingPoint = ApplyLinkLateralOffset(LinkEnd[arrivalLink[i]], LinkStart[arrivalLink[i]], LinkEnd[arrivalLink[i]], LinkWidth[arrivalLink[i]], lateralT);
+                    float3 landingPoint = ApplyLinkLateralOffset(LinkEnd[arrivalLink[i]], LinkStart[arrivalLink[i]], LinkEnd[arrivalLink[i]], LinkWidth[arrivalLink[i]], lateralT, triPath[i]);
                     waypointsOut.Add(landingPoint);
                     isLinkArrivalOut.Add(true);
 
@@ -398,27 +398,27 @@ namespace CustomNavMesh
         /// juntos ficavam visualmente sobrepostos numa fila de largura zero em vez de
         /// espalhados pela largura real do link (uma ponte, zip-line ou passagem larga).
         ///
-        /// O ponto deslocado é VALIDADO contra o grid espacial (mesmo FindNearestTriangle
-        /// usado em todo o resto do pathfinding) e reprojetado no triângulo real mais
-        /// próximo — sem isso, um 'width' generoso poderia empurrar o ponto de pouso/partida
-        /// pra fora de qualquer triângulo real (ex.: um link cuja ÁREA CAMINHÁVEL ao redor é
-        /// mais estreita que o 'width' configurado), e o agente pousaria no vazio. Se a
-        /// busca não achar NENHUM triângulo perto do ponto deslocado, cai de volta pro ponto
-        /// original (sem deslocamento) — modo mais seguro que arriscar um pouso inválido.
+        /// O ponto (deslocado ou não) é sempre reprojetado em 'pathTriangle' — o triângulo
+        /// do caminho do A* onde o salto parte/pousa (LinkFromTriangle/LinkToTriangle). Antes
+        /// era reprojetado com FindNearestTriangle global, que podia escolher um triângulo
+        /// FORA do trecho do caminho (um patch vizinho do outro lado de uma borda, perto da
+        /// ponta do link): o funil mirava um ponto que o agente não alcança andando, e ele
+        /// ficava preso na borda a ~1-2m da partida do link (visto no jogo). Sem
+        /// deslocamento (width 0), a reprojeção ainda importa: as pontas de um NavMeshLink
+        /// costumam ficar um pouco fora da malha.
         /// </summary>
-        float3 ApplyLinkLateralOffset(float3 point, float3 linkStart, float3 linkEnd, float width, float lateralT)
+        float3 ApplyLinkLateralOffset(float3 point, float3 linkStart, float3 linkEnd, float width, float lateralT, int pathTriangle)
         {
-            if (width <= 0f) return point;
-
             float3 dir = linkEnd - linkStart;
             float len = math.length(dir);
-            if (len < 1e-5f) return point; // link degenerado (pontos coincidentes) — nada a deslocar
+            if (width > 0f && len >= 1e-5f) // link degenerado (pontos coincidentes): nada a deslocar
+            {
+                float3 lateral = math.normalizesafe(math.cross(new float3(0f, 1f, 0f), dir / len));
+                point += lateral * (lateralT * width * 0.5f);
+            }
 
-            float3 lateral = math.normalizesafe(math.cross(new float3(0f, 1f, 0f), dir / len));
-            float3 offsetPoint = point + lateral * (lateralT * width * 0.5f);
-
-            int tri = NavMeshQueryUtil.FindNearestTriangle(offsetPoint, Grid, Vertices, Triangles, out float3 validated);
-            return tri >= 0 ? validated : point;
+            int3 t = Triangles[pathTriangle];
+            return NavMeshQueryUtil.ClosestPointOnTriangle(point, Vertices[t.x], Vertices[t.y], Vertices[t.z]);
         }
 
         static void ReverseInPlace(NativeList<int> list)

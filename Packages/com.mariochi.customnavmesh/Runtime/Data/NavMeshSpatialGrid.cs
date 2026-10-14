@@ -69,19 +69,27 @@ namespace CustomNavMesh
         /// automático ainda não performar bem, desligue `Auto Triangle Grid Cell Size` e
         /// calibre manualmente (ver README, "Mapas grandes").
         /// </summary>
-        public static float EstimateAverageEdgeLength(in NavMeshGraph graph)
+        public static float EstimateAverageEdgeLength(in NavMeshGraph graph) =>
+            graph.TriangleCount == 0 ? 1f : EstimateAverageEdgeLength(graph.Vertices.ToArray(), graph.Triangles.ToArray());
+
+        /// <summary>
+        /// Mesma estimativa sobre arrays gerenciados — usada por NavMeshGraphBuilder.BuildManaged
+        /// fora da main thread (indexar NativeArray em C# gerenciado, com as checagens de
+        /// segurança do Editor, custava ~16ms por rebuild num mapa de ~28k triângulos).
+        /// </summary>
+        public static float EstimateAverageEdgeLength(float3[] vertices, int3[] triangles)
         {
-            int count = graph.TriangleCount;
+            int count = triangles.Length;
             if (count == 0) return 1f; // sem triângulo nenhum — grid fica vazio de qualquer jeito, valor não importa
 
             double weightedSum = 0;
             double areaSum = 0;
             for (int t = 0; t < count; t++)
             {
-                int3 tri = graph.Triangles[t];
-                float3 a = graph.Vertices[tri.x];
-                float3 b = graph.Vertices[tri.y];
-                float3 c = graph.Vertices[tri.z];
+                int3 tri = triangles[t];
+                float3 a = vertices[tri.x];
+                float3 b = vertices[tri.y];
+                float3 c = vertices[tri.z];
 
                 float avgEdge = (math.distance(a, b) + math.distance(b, c) + math.distance(c, a)) / 3f;
                 float area = 0.5f * math.length(math.cross(b - a, c - a));
@@ -98,10 +106,10 @@ namespace CustomNavMesh
                 double sum = 0;
                 for (int t = 0; t < count; t++)
                 {
-                    int3 tri = graph.Triangles[t];
-                    sum += math.distance(graph.Vertices[tri.x], graph.Vertices[tri.y])
-                         + math.distance(graph.Vertices[tri.y], graph.Vertices[tri.z])
-                         + math.distance(graph.Vertices[tri.z], graph.Vertices[tri.x]);
+                    int3 tri = triangles[t];
+                    sum += math.distance(vertices[tri.x], vertices[tri.y])
+                         + math.distance(vertices[tri.y], vertices[tri.z])
+                         + math.distance(vertices[tri.z], vertices[tri.x]);
                 }
                 return (float)(sum / (count * 3));
             }

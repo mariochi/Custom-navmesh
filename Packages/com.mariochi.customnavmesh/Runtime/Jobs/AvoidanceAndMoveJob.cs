@@ -908,24 +908,38 @@ namespace CustomNavMesh
 
             if (seedTri >= 0 && seedTri < NavTriangles.Length)
             {
-                int found = TestTriangleAndNeighbors(seedTri, p, TriangleStickyMargin, out float3 cp, out float d2);
-                if (found >= 0 && d2 <= threshold)
+                int found = TestTriangleAndNeighbors(seedTri, p, TriangleStickyMargin, out float3 cp, out float d2, out bool inside);
+                if (found >= 0 && inside && d2 <= threshold)
                 {
                     closest = cp;
                     return found;
                 }
 
-                // camada 2: BFS por adjacência real, bem mais permissivo em alcance que o
-                // 1-anel acima mas ainda incapaz de atravessar uma parede (não existe
-                // NavNeighbors através de uma fronteira sem conexão real na malha).
+                // camada 2: o 1-anel acima só enxerga vizinhos de ARESTA. Se 'p' não está em
+                // cima de nenhum deles (em XZ), ou ele saiu do alcance do anel, ou atravessou
+                // um VÉRTICE pra um triângulo que só compartilha esse vértice com o atual —
+                // caso rotineiro: o funil coloca waypoints exatamente nos cantos (vértices),
+                // muitas vezes nas quinas entre tiles. Antes, a camada 1 aceitava o ponto mais
+                // próximo do triângulo atual mesmo assim (d2 pequeno), que é o próprio vértice:
+                // o agente era clampado de volta pro canto todo frame e ficava preso ali pra
+                // sempre (NoProgress). O BFS por adjacência real resolve o leque de triângulos
+                // em volta do vértice sem atravessar parede nenhuma.
                 if (WallSafeBfsHops > 0)
                 {
-                    int foundBfs = TestTriangleBFS(seedTri, p, WallSafeBfsHops, out float3 cpBfs, out float d2Bfs);
-                    if (foundBfs >= 0 && d2Bfs <= threshold)
+                    int foundBfs = TestTriangleBFS(seedTri, p, WallSafeBfsHops, out float3 cpBfs, out float d2Bfs, out bool insideBfs);
+                    if (foundBfs >= 0 && (insideBfs || !inside) && d2Bfs <= threshold)
                     {
                         closest = cpBfs;
                         return foundBfs;
                     }
+                }
+
+                // nenhum triângulo próximo contém 'p': ele está empurrando contra uma borda
+                // real da malha (parede/vão) — clampa na borda do 1-anel, como antes.
+                if (found >= 0 && d2 <= threshold)
+                {
+                    closest = cp;
+                    return found;
                 }
             }
 
@@ -935,53 +949,119 @@ namespace CustomNavMesh
         }
 
         /// <summary>
+        /// Folga (em metros, perpendicular a cada aresta) do teste "'p' está em cima deste
+        /// triângulo" em XZ. Só XZ, de propósito: a componente Y da velocidade preferida
+        /// raramente deixa 'p' exatamente na superfície de uma rampa, e o ponto mais próximo
+        /// em 3D de um ponto acima de uma rampa não coincide com a projeção vertical.
+        /// </summary>
+        const float InsideToleranceXZ = 1e-3f;
+
+        static float Cross2(float2 a, float2 b) => a.x * b.y - a.y * b.x;
+
+        static bool IsInsideXZ(float3 p, float3 a, float3 b, float3 c)
+        {
+            float2 q = p.xz, pa = a.xz, pb = b.xz, pc = c.xz;
+            float area = Cross2(pb - pa, pc - pa);
+            if (math.abs(area) < 1e-8f) return false;
+            float s = math.sign(area); // winding indiferente
+            return s * Cross2(pb - pa, q - pa) >= -InsideToleranceXZ * math.length(pb - pa)
+                && s * Cross2(pc - pb, q - pb) >= -InsideToleranceXZ * math.length(pc - pb)
+                && s * Cross2(pa - pc, q - pc) >= -InsideToleranceXZ * math.length(pa - pc);
+        }
+
+        /// <summary>
+        /// Ponto do triângulo exatamente abaixo/acima de 'p' (mesmo XZ, Y do plano do
+        /// triângulo) — usado quando 'p' está em cima do triângulo em XZ. O ponto mais
+        /// próximo em 3D não serve aqui: com 'p' fora da superfície (a componente Y da
+        /// velocidade aponta pro waypoint, não segue a inclinação local), a projeção ao longo
+        /// da normal de uma rampa tem componente XZ que empurra o agente de volta — visto no
+        /// jogo como agente "patinando" parado ao descer em direção a um alvo do outro lado
+        /// de uma crista (avança alguns cm, o clamp devolve os mesmos cm, todo frame).
+        /// </summary>
+        static float3 ProjectVerticallyOntoTriangle(float3 p, float3 a, float3 b, float3 c)
+        {
+            float2 v0 = b.xz - a.xz, v1 = c.xz - a.xz, v2 = p.xz - a.xz;
+            float den = Cross2(v0, v1);
+            if (math.abs(den) < 1e-8f) return NavMeshQueryUtil.ClosestPointOnTriangle(p, a, b, c);
+            float v = Cross2(v2, v1) / den;
+            float w = Cross2(v0, v2) / den;
+            return new float3(p.x, a.y + v * (b.y - a.y) + w * (c.y - a.y), p.z);
+        }
+
+        /// <summary>
+        /// Avalia um triângulo como candidato pro clamp: em cima dele (XZ) → projeção
+        /// vertical e distância só em Y (pisos sobrepostos: vence o mais próximo em altura);
+        /// fora → ponto mais próximo em 3D (agente empurrando contra uma borda real).
+        /// </summary>
+        static void EvaluateCandidate(float3 p, float3 a, float3 b, float3 c, out float3 point, out float distance, out bool inside)
+        {
+            inside = IsInsideXZ(p, a, b, c);
+            if (inside)
+            {
+                point = ProjectVerticallyOntoTriangle(p, a, b, c);
+                distance = math.abs(point.y - p.y);
+            }
+            else
+            {
+                point = NavMeshQueryUtil.ClosestPointOnTriangle(p, a, b, c);
+                distance = math.distance(point, p);
+            }
+        }
+
+        /// <summary>
+        /// Um candidato substitui o melhor atual se contém 'p' em XZ e o atual não; se os
+        /// dois estão no mesmo caso (pisos sobrepostos, ou ambos fora), vence a menor
+        /// distância 3D — com 'margin' de histerese a favor do atual.
+        /// </summary>
+        static bool IsBetterCandidate(bool inside, float d, bool bestInside, float bestDist, float margin)
+        {
+            if (inside != bestInside) return inside;
+            return d + margin < bestDist;
+        }
+
+        /// <summary>
         /// BFS bounded a partir de 'startTri', caminhando só por NavNeighbors (adjacência
         /// REAL de malha) até 'maxHops' saltos — devolve o triângulo visitado mais perto de
-        /// 'p'. Ao contrário de FindNearestTriangle (que busca por distância euclidiana no
-        /// grid espacial, ignorando se há caminho real até lá), isso NUNCA pode "atravessar"
-        /// uma parede/vão fino: se dois pontos estão fisicamente próximos mas em lados
-        /// opostos de uma parede, o NavMesh não tem NENHUMA aresta de adjacência conectando
-        /// os triângulos dos dois lados (é exatamente isso que define uma parede na malha),
-        /// então o BFS nunca alcança o lado errado. Cobre o caso de um empurrão de avoidance
-        /// ou salto de posição grande o bastante pra sair do alcance de
-        /// TestTriangleAndNeighbors (1 anel) mas ainda dentro da mesma região conectada.
-        /// Sem deduplicação de visitados: o custo de revisitar um triângulo já visto é só
-        /// um ClosestPointOnTriangle a mais, nunca um loop infinito (a expansão para no
-        /// maxHops de qualquer forma) — mas como cada triângulo tem até 3 vizinhos, sem
-        /// dedupe o tamanho da fronteira pode crescer geometricamente (até 3^hop no pior
-        /// caso, quando vários triângulos revisitados reabrem os mesmos vizinhos a cada
-        /// anel). MaxTotalVisits limita o custo TOTAL da busca independente de maxHops,
-        /// como uma segunda trava de segurança além do limite de saltos.
+        /// 'p', preferindo um que contenha 'p' em XZ (ver IsBetterCandidate). Ao contrário de
+        /// FindNearestTriangle (que busca por distância euclidiana no grid espacial, ignorando
+        /// se há caminho real até lá), isso NUNCA pode "atravessar" uma parede/vão fino: se
+        /// dois pontos estão fisicamente próximos mas em lados opostos de uma parede, o
+        /// NavMesh não tem NENHUMA aresta de adjacência conectando os triângulos dos dois
+        /// lados (é exatamente isso que define uma parede na malha), então o BFS nunca
+        /// alcança o lado errado. Para no primeiro anel em que achar um triângulo contendo
+        /// 'p' (o mais próximo em saltos). Visitados são deduplicados; MaxTotalVisits limita
+        /// o custo total como segunda trava além do limite de saltos.
         /// </summary>
         const int MaxTotalVisits = 512;
 
-        int TestTriangleBFS(int startTri, float3 p, int maxHops, out float3 closest, out float distSq)
+        int TestTriangleBFS(int startTri, float3 p, int maxHops, out float3 closest, out float distSq, out bool inside)
         {
             var frontier = new NativeList<int>(16, Allocator.Temp);
             var nextFrontier = new NativeList<int>(16, Allocator.Temp);
+            var visited = new NativeHashSet<int>(64, Allocator.Temp);
 
             int best = -1;
-            float bestDistSq = float.MaxValue;
+            float bestDist = float.MaxValue;
+            bool bestInside = false;
             float3 bestPoint = p;
-            int totalVisits = 0;
 
             frontier.Add(startTri);
+            visited.Add(startTri);
 
-            for (int hop = 0; hop <= maxHops && frontier.Length > 0 && totalVisits < MaxTotalVisits; hop++)
+            for (int hop = 0; hop <= maxHops && frontier.Length > 0 && !bestInside; hop++)
             {
                 nextFrontier.Clear();
 
-                for (int f = 0; f < frontier.Length && totalVisits < MaxTotalVisits; f++)
+                for (int f = 0; f < frontier.Length; f++)
                 {
                     int t = frontier[f];
-                    totalVisits++;
 
                     int3 tri = NavTriangles[t];
-                    float3 cp = NavMeshQueryUtil.ClosestPointOnTriangle(p, NavVertices[tri.x], NavVertices[tri.y], NavVertices[tri.z]);
-                    float d2 = math.distancesq(cp, p);
-                    if (d2 < bestDistSq)
+                    EvaluateCandidate(p, NavVertices[tri.x], NavVertices[tri.y], NavVertices[tri.z], out float3 cp, out float d, out bool triInside);
+                    if (best < 0 || IsBetterCandidate(triInside, d, bestInside, bestDist, 0f))
                     {
-                        bestDistSq = d2;
+                        bestDist = d;
+                        bestInside = triInside;
                         best = t;
                         bestPoint = cp;
                     }
@@ -992,7 +1072,8 @@ namespace CustomNavMesh
                     for (int e = 0; e < 3; e++)
                     {
                         int nb = nbs[e];
-                        if (nb >= 0) nextFrontier.Add(nb);
+                        if (nb >= 0 && visited.Count < MaxTotalVisits && visited.Add(nb))
+                            nextFrontier.Add(nb);
                     }
                 }
 
@@ -1002,28 +1083,31 @@ namespace CustomNavMesh
             }
 
             closest = bestPoint;
-            distSq = bestDistSq;
+            distSq = bestDist * bestDist;
+            inside = bestInside;
 
             frontier.Dispose();
             nextFrontier.Dispose();
+            visited.Dispose();
             return best;
         }
 
         /// <summary>
         /// Testa o triângulo em cache + seus 3 vizinhos diretos e devolve o mais próximo de
-        /// 'p' — COM histerese: um vizinho só derruba o triângulo atual se vencer por mais de
-        /// 'stickyMargin' de distância (não apenas por estar marginalmente mais perto). Sem
-        /// essa margem, em trechos com triângulos pequenos e muito próximos entre si
-        /// (principalmente degraus de escada) o "vencedor" muda a cada frame só por ruído de
-        /// sub-milímetro na posição — cada troca reprojeta a posição clampada (sobretudo o Y)
-        /// discretamente, e como a direção do frame seguinte é calculada a partir dela, isso
+        /// 'p'. Um triângulo que contém 'p' em XZ sempre vence um que não contém — sem isso,
+        /// um ponto que já atravessou a aresta podia continuar "preso" ao triângulo antigo
+        /// por causa da histerese abaixo (uma travessia rasa, ou lenta, penetra menos que a
+        /// margem). Entre candidatos no mesmo caso, histerese: um vizinho só derruba o
+        /// triângulo atual se vencer por mais de 'stickyMargin' de distância. Sem essa margem,
+        /// em trechos com triângulos pequenos e sobrepostos em altura (principalmente degraus
+        /// de escada) o "vencedor" muda a cada frame só por ruído de sub-milímetro na posição
+        /// — cada troca reprojeta a posição clampada (sobretudo o Y) discretamente, e isso
         /// aparece como zigue-zague bem localizado nas bordas dos degraus.
         /// </summary>
-        int TestTriangleAndNeighbors(int tri, float3 p, float stickyMargin, out float3 closest, out float distSq)
+        int TestTriangleAndNeighbors(int tri, float3 p, float stickyMargin, out float3 closest, out float distSq, out bool inside)
         {
             int3 t0 = NavTriangles[tri];
-            float3 bestPoint = NavMeshQueryUtil.ClosestPointOnTriangle(p, NavVertices[t0.x], NavVertices[t0.y], NavVertices[t0.z]);
-            float bestDist = math.distance(bestPoint, p);
+            EvaluateCandidate(p, NavVertices[t0.x], NavVertices[t0.y], NavVertices[t0.z], out float3 bestPoint, out float bestDist, out bool bestInside);
             int best = tri;
 
             int3 nbs = NavNeighbors[tri];
@@ -1033,11 +1117,11 @@ namespace CustomNavMesh
                 if (nb < 0) continue;
 
                 int3 tn = NavTriangles[nb];
-                float3 cp = NavMeshQueryUtil.ClosestPointOnTriangle(p, NavVertices[tn.x], NavVertices[tn.y], NavVertices[tn.z]);
-                float d = math.distance(cp, p);
-                if (d + stickyMargin < bestDist)
+                EvaluateCandidate(p, NavVertices[tn.x], NavVertices[tn.y], NavVertices[tn.z], out float3 cp, out float d, out bool nbInside);
+                if (IsBetterCandidate(nbInside, d, bestInside, bestDist, stickyMargin))
                 {
                     bestDist = d;
+                    bestInside = nbInside;
                     best = nb;
                     bestPoint = cp;
                 }
@@ -1045,6 +1129,7 @@ namespace CustomNavMesh
 
             closest = bestPoint;
             distSq = bestDist * bestDist;
+            inside = bestInside;
             return best;
         }
 

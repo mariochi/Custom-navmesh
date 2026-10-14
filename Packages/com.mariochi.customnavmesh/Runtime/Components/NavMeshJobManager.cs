@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using Unity.AI.Navigation; // NavMeshLink — vem do pacote com.unity.ai.navigation, NÃO de UnityEngine.AI
 using Unity.Collections;
 using Unity.Jobs;
@@ -100,6 +101,13 @@ namespace CustomNavMesh
             "duas regiões, removê-lo pode desconectá-las — suba com cautela e confira " +
             "'Draw NavMesh Gizmo' depois de mudar.")]
         [SerializeField] float minTriangleArea = NavMeshGraphBuilder.DefaultMinTriangleArea;
+        [Tooltip("Diferença máxima de altura (m) pra reparar uma T-junction entre tiles: uma " +
+            "borda de tile que passa (em XZ) por um vértice de borda do tile vizinho sem " +
+            "compartilhá-lo. Sem o reparo, a adjacência não liga os dois tiles ali e o A* " +
+            "devolve BestEffort pra destinos que o NavMesh nativo alcança (visto em escadas). " +
+            "Cobre a divergência de altura do detail mesh entre tiles; baixo o bastante pra não " +
+            "colar bordas empilhadas de verdade. 0 ou negativo desliga o reparo.")]
+        [SerializeField] float tJunctionHeightTolerance = NavMeshGraphBuilder.DefaultTJunctionHeightTolerance;
         [Tooltip("Margem de histerese (metros) que um triângulo vizinho precisa vencer POR, em " +
             "distância, pra substituir o triângulo em cache no clamp de superfície de cada agente " +
             "(ClampToNavMesh). Sem isso, em trechos com triângulos pequenos e muito próximos entre si " +
@@ -179,6 +187,28 @@ namespace CustomNavMesh
             "reempurrar um debounce que nunca fecha. 0 ou negativo desliga esse polling " +
             "(comportamento 100% manual, como antes).")]
         [SerializeField] float staleDetectionInterval = 2f;
+
+        /// <summary>
+        /// Intervalo do polling de StalenessWatcher (ver tooltip do campo). Cada tick chama
+        /// NavMesh.CalculateTriangulation() na main thread — ~10-15ms num mapa de ~60k
+        /// vértices, um pico periódico visível. Jogos que já chamam NotifyNavMeshChanged()
+        /// em todo lugar que muda a malha podem desligar (0) em runtime.
+        /// </summary>
+        public float StaleDetectionInterval
+        {
+            get => staleDetectionInterval;
+            set
+            {
+                staleDetectionInterval = value;
+                if (staleDetectionCoroutine != null)
+                {
+                    StopCoroutine(staleDetectionCoroutine);
+                    staleDetectionCoroutine = null;
+                }
+                if (value > 0f && Instance == this && isActiveAndEnabled)
+                    staleDetectionCoroutine = StartCoroutine(StalenessWatcher());
+            }
+        }
 
         [Header("Avoidance")]
         [Tooltip("Tamanho de célula do grid usado pra achar agentes/obstáculos próximos (broad-phase " +
@@ -419,7 +449,10 @@ namespace CustomNavMesh
         }
 #endif
 
-        Coroutine autoRebuildCoroutine;
+        // flag, não a referência da Coroutine: com prazo já vencido (RebuildGraphAsync) a
+        // corrotina roda até o 1º yield DENTRO do StartCoroutine e se marca como terminada
+        // antes do retorno — guardar o retorno sobrescrevia isso e travava todo rebuild futuro.
+        bool rebuildScheduled;
         float autoRebuildDeadline;
         Coroutine staleDetectionCoroutine;
         NavMeshSignature lastSignature;
@@ -513,8 +546,9 @@ namespace CustomNavMesh
             // corrotina sozinho mas NÃO zera nossa referência — sem isso, NotifyNavMeshChanged()
             // acharia (errado) que ainda tem uma corrotina rodando depois de reativado, e o
             // debounce ficaria travado pra sempre (nunca mais chamando StartCoroutine de novo).
-            autoRebuildCoroutine = null;
+            rebuildScheduled = false;
             staleDetectionCoroutine = null; // mesmo motivo, pro polling de StalenessWatcher
+            backgroundBuildRunning = false; // a corrotina que esperava a Task morreu junto; o resultado é descartado
         }
 
         /// <summary>
@@ -546,21 +580,75 @@ namespace CustomNavMesh
             // — várias mudanças em sequência rápida (vários obstáculos entrando juntos) viram
             // uma única reconstrução em vez de uma por chamada.
             autoRebuildDeadline = Time.time + autoRebuildDebounce;
-            if (autoRebuildCoroutine == null)
-                autoRebuildCoroutine = StartCoroutine(AutoRebuildDebounced());
+            if (!rebuildScheduled)
+            {
+                rebuildScheduled = true;
+                StartCoroutine(RebuildInBackground());
+            }
         }
 
-        IEnumerator AutoRebuildDebounced()
+        /// <summary>
+        /// Reconstrói o grafo sem travar a main thread (ver RebuildInBackground) e, ao
+        /// terminar, repath em todos os agentes com destino. Sem debounce e independente de
+        /// Auto Rebuild On NavMesh Change — pra quem cria o manager em runtime e não quer
+        /// pagar o RebuildGraph() síncrono (centenas de ms num mapa grande) naquele frame.
+        /// Agentes registrados antes de terminar ficam parados e com pedidos de caminho na
+        /// fila até o grafo existir.
+        /// </summary>
+        public void RebuildGraphAsync()
         {
-            while (Time.time < autoRebuildDeadline)
+            autoRebuildDeadline = Time.time;
+            if (!rebuildScheduled)
+            {
+                rebuildScheduled = true;
+                StartCoroutine(RebuildInBackground());
+            }
+        }
+
+        /// <summary>True enquanto um rebuild em background está em andamento.</summary>
+        public bool IsRebuildingGraph => backgroundBuildRunning;
+
+        bool backgroundBuildRunning;
+
+        /// <summary>
+        /// Rebuild disparado durante o jogo (NotifyNavMeshChanged, StalenessWatcher,
+        /// RebuildGraphAsync). Antes era um RebuildGraph() síncrono: ~0,25-0,7s de main
+        /// thread num mapa de ~28k triângulos, uma travada visível no jogo a cada portão ou
+        /// barreira com carving. Agora só NavMesh.CalculateTriangulation() (main thread
+        /// obrigatória, ~10-15ms) roda aqui; solda/slivers/T-junctions/adjacência
+        /// (NavMeshGraphBuilder.BuildManaged, sem API do Unity) rodam numa Task, e a troca
+        /// pro grafo novo (ApplyGraph — cópia pra NativeArrays, grid, links) acontece num
+        /// frame só quando ela termina. Enquanto isso os agentes seguem no grafo antigo.
+        /// Uma nova notificação durante o build espera ele terminar e roda outro em seguida.
+        /// </summary>
+        IEnumerator RebuildInBackground()
+        {
+            while (Time.time < autoRebuildDeadline || backgroundBuildRunning)
                 yield return null;
 
-            autoRebuildCoroutine = null;
+            rebuildScheduled = false; // a partir daqui, novas notificações agendam outro rebuild
+            backgroundBuildRunning = true;
+
+            NavMeshTriangulation tri = NavMesh.CalculateTriangulation();
+            NavMeshSignature signature = ComputeSignature(tri);
+            float weld = vertexWeldEpsilon, minArea = minTriangleArea, tJunction = tJunctionHeightTolerance;
+            Task<NavMeshGraphBuilder.ManagedGraph> build = Task.Run(() =>
+                NavMeshGraphBuilder.BuildManaged(tri.vertices, tri.indices, tri.areas, weld, minArea, tJunction));
+
+            while (!build.IsCompleted)
+                yield return null;
+
+            backgroundBuildRunning = false;
+            if (build.IsFaulted)
+            {
+                Debug.LogException(build.Exception, this);
+                yield break;
+            }
 
             // fecha o ciclo completo: grafo novo (topologia atualizada) + força quem já tinha
-            // corredor calculado a recalcular em cima da malha nova (RebuildGraph sozinho não
+            // corredor calculado a recalcular em cima da malha nova (trocar o grafo sozinho não
             // faz isso — só invalida os índices de triângulo, não repropõe destino a ninguém).
-            RebuildGraph();
+            ApplyGraph(build.Result, signature);
             RepathAllAgents();
         }
 
@@ -606,9 +694,12 @@ namespace CustomNavMesh
             // aqui garante que NavMesh.CalculateTriangulation() já vai enxergar a malha.
             if (Instance == this)
             {
-                RebuildGraph();
+                // quem criou o manager em runtime pode já ter construído o grafo (RebuildGraph)
+                // ou disparado RebuildGraphAsync() — não paga o build de novo.
+                if (!graphReady && !backgroundBuildRunning && !rebuildScheduled)
+                    RebuildGraph();
 
-                if (staleDetectionInterval > 0f)
+                if (staleDetectionInterval > 0f && staleDetectionCoroutine == null)
                     staleDetectionCoroutine = StartCoroutine(StalenessWatcher());
             }
         }
@@ -677,12 +768,27 @@ namespace CustomNavMesh
         /// </summary>
         public void RebuildGraph()
         {
+            NavMeshTriangulation tri = NavMesh.CalculateTriangulation();
+            NavMeshGraphBuilder.ManagedGraph built = NavMeshGraphBuilder.BuildManaged(
+                tri.vertices, tri.indices, tri.areas, vertexWeldEpsilon, minTriangleArea, tJunctionHeightTolerance);
+            ApplyGraph(built, ComputeSignature(tri));
+        }
+
+        /// <summary>
+        /// Troca o grafo em uso pelo resultado de NavMeshGraphBuilder.BuildManaged (cópia pra
+        /// NativeArrays, grid espacial, links, buffers de flow field). Main thread.
+        /// 'signature' é a assinatura da MESMA triangulação usada no build — referência pro
+        /// StalenessWatcher (antes era uma 2ª chamada a CalculateTriangulation() aqui).
+        /// </summary>
+        void ApplyGraph(NavMeshGraphBuilder.ManagedGraph built, NavMeshSignature signature)
+        {
             frameHandle.Complete();
 
             if (graph.IsCreated) graph.Dispose();
             if (triGrid.IsCreated) triGrid.Dispose();
 
-            graph = NavMeshGraphBuilder.BuildFromUnityNavMesh(Allocator.Persistent, vertexWeldEpsilon, minTriangleArea);
+            NavMeshGraphBuilder.LogBuildStats(built, minTriangleArea);
+            graph = NavMeshGraphBuilder.ToNativeGraph(built, Allocator.Persistent);
 
             // calibração automática do Triangle Grid Cell Size (ver tooltip do campo): pega o
             // comprimento médio de aresta dos triângulos DESTE grafo e aplica o multiplicador —
@@ -692,7 +798,7 @@ namespace CustomNavMesh
             float effectiveCellSize = triangleGridCellSize;
             if (autoTriangleGridCellSize && graph.TriangleCount > 0)
             {
-                float avgEdge = NavMeshSpatialGrid.EstimateAverageEdgeLength(graph);
+                float avgEdge = built.AverageEdgeLength; // calculado em BuildManaged, fora da main thread
                 effectiveCellSize = math.max(0.01f, avgEdge * autoCellSizeMultiplier);
             }
 
@@ -734,10 +840,8 @@ namespace CustomNavMesh
             }
 
             // assinatura da triangulação que ACABOU de ser usada pra montar o grafo — referência
-            // pra StalenessWatcher comparar depois. Custa uma 2ª chamada a CalculateTriangulation()
-            // (a 1ª foi dentro de BuildFromUnityNavMesh, que não expõe a triangulação bruta pra
-            // fora), aceitável aqui porque RebuildGraph já é uma operação pesada e pouco frequente.
-            lastSignature = ComputeSignature(NavMesh.CalculateTriangulation());
+            // pra StalenessWatcher comparar depois.
+            lastSignature = signature;
 
             // buffers de flow field são dimensionados por TriangleCount — precisam ser realocados
             // toda vez que o grafo muda, e os campos antigos ficam inválidos (índices de triângulo
@@ -1566,6 +1670,7 @@ namespace CustomNavMesh
             ExpirePerFrameOverrides();
 
             CheckFlowFieldArrivals();
+            ContinuePartialCorridors();
             CollectRepathRequests();
             // NAO agenda os Jobs aqui -- ver LateUpdate(). Agendar so depois que TODO Update()
             // da cena ja rodou garante que qualquer SetVelocityOverride/SetPaused/SetDestination
@@ -1698,6 +1803,28 @@ namespace CustomNavMesh
                 bool needsLink = flowFieldLinkTriangle[offset] >= 0;
                 if (dist <= flowFieldArriveDistance || needsLink)
                     agentComponents[i].SetDestination(flowFieldPersonalTarget[i]);
+            }
+        }
+
+        /// <summary>
+        /// Um corredor PartialCorridor foi truncado em MaxCorridorPoints — o destino real
+        /// fica além do último waypoint. Antes, o agente chegava nesse ponto e parava ali pra
+        /// sempre (HasReachedEnd true, ninguém pedia o resto do caminho; visto no jogo em
+        /// trajetos longos com muitas curvas). Assim que ele passa a mirar o ÚLTIMO waypoint,
+        /// pede um novo caminho até o mesmo destino, a partir de onde está — o pedido é
+        /// resolvido enquanto ele ainda anda até esse ponto, então não há parada visível.
+        /// </summary>
+        void ContinuePartialCorridors()
+        {
+            for (int i = 0; i < count; i++)
+            {
+                if (pathStatus[i] != (byte)PathStatus.PartialCorridor || flowFieldSlot[i] >= 0) continue;
+                int len = corridorLength[i];
+                if (len <= 0 || corridorCursor[i] < len - 1 || pendingRepathSet.Contains(i)) continue;
+
+                var agent = agentComponents[i];
+                if (agent != null && agent.HasDestination)
+                    agent.SetDestination((Vector3)agent.Destination);
             }
         }
 

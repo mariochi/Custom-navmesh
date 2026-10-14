@@ -317,14 +317,28 @@ NavMeshJobManager.Instance.NotifyNavMeshChanged();
 - `Auto Rebuild On NavMesh Change` (default `true`) é um master switch — desligado, as
   chamadas a `NotifyNavMeshChanged()` são ignoradas (útil pra desligar tudo de uma vez em
   debug/profiling sem precisar tirar a chamada do código do jogo).
-- Por baixo dos panos, chama `RebuildGraph()` + `RepathAllAgents()` — as duas peças
-  continuam expostas separadamente se você quiser controle mais fino:
+- **Não trava a main thread.** Só `NavMesh.CalculateTriangulation()` (~10-15ms num mapa
+  de ~60k vértices — tem que ser na main thread) roda no frame em que o debounce vence;
+  solda, slivers, T-junctions e adjacência (`NavMeshGraphBuilder.BuildManaged`, sem API do
+  Unity) rodam numa `Task`, e a troca pro grafo novo acontece num frame só quando ela
+  termina (~0,3s depois num mapa de ~28k triângulos). Até lá os agentes seguem no grafo
+  antigo. Antes, isso era um `RebuildGraph()` síncrono de 0,3-0,7s — uma travada visível no
+  jogo a cada portão ou barreira com carving. Uma notificação que chega durante um build
+  espera ele terminar e dispara outro. Depois da troca, chama `RepathAllAgents()`.
+- As peças continuam expostas separadamente se você quiser controle mais fino:
 
 ```csharp
-NavMeshJobManager.Instance.RebuildGraph();               // reconstrói o grafo a partir do NavMesh atual (síncrono, sem debounce)
+NavMeshJobManager.Instance.RebuildGraph();               // reconstrói o grafo a partir do NavMesh atual (síncrono, sem debounce — trava a main thread)
+NavMeshJobManager.Instance.RebuildGraphAsync();          // mesmo resultado em background, sem debounce; repath de todos no fim
 NavMeshJobManager.Instance.RepathAllAgents();             // força recálculo de quem tem destino ativo (modo corredor)
 NavMeshJobManager.Instance.RepathAgentsNear(point, 10f);  // versão barata: só quem está perto do que mudou
 ```
+
+`IsRebuildingGraph` diz se há um build em background em andamento. Quem cria o
+`NavMeshJobManager` em runtime (ex.: no primeiro agente que nasce) pode chamar
+`RebuildGraphAsync()` logo depois do `AddComponent` — o `Start()` não constrói de novo se já
+houver grafo ou build em andamento; agentes registrados antes ficam parados com os pedidos
+de caminho na fila até o grafo existir.
 
 `RebuildGraph()` sozinho **não** força ninguém a recalcular — só invalida os índices de
 triângulo internos. Sem `RepathAllAgents()`/`RepathAgentsNear()` em seguida, um agente
@@ -353,6 +367,12 @@ verificação no ritmo do intervalo configurado (não a cada frame) e só age qu
 assinatura realmente difere, então não corre o risco de reempurrar um debounce que nunca
 fecha. Configure `Stale Detection Interval <= 0` pra desligar esse polling e voltar ao
 comportamento 100% manual (custo zero fora do intervalo, mas sem essa rede de segurança).
+
+**Custo**: cada tick chama `NavMesh.CalculateTriangulation()` na main thread — ~10-15ms num
+mapa de ~60k vértices, um pico periódico perceptível. Se o jogo já chama
+`NotifyNavMeshChanged()` em todo lugar que muda a malha, desligue em runtime pela propriedade
+`NavMeshJobManager.StaleDetectionInterval = 0` (ela também reinicia o polling com um valor
+novo).
 
 **A assinatura cobre DUAS fontes de mudança independentes**: a triangulação em si (nº de
 vértices/índices, soma bruta de coordenadas — via `NavMesh.CalculateTriangulation()`) E
@@ -781,8 +801,8 @@ de calibração pra esse tamanho de mapa é o **broad-phase**, não o pathfindin
   (32) ainda é suficiente pro seu caso.
 - **Tiles do NavMesh (`Vertex Weld Epsilon`).** Mapas grandes quase sempre são baked em
   múltiplos tiles (Recast/Detour). `NavMesh.CalculateTriangulation()` não garante índice
-  de vértice compartilhado na costura entre tiles — sem tratar isso, `BuildTriangleAdjacencyJob`
-  enxerga cada tile como uma ilha isolada e todo path que cruza uma fronteira de tile falha
+  de vértice compartilhado na costura entre tiles — sem tratar isso, a adjacência por índice
+  de vértice (`NavMeshGraphBuilder.BuildAdjacency`) enxerga cada tile como uma ilha isolada e todo path que cruza uma fronteira de tile falha
   com `PathStatus.NoPath`, mesmo o NavMesh sendo visualmente contínuo. `NavMeshGraphBuilder`
   já solda vértices coincidentes (dentro de `Vertex Weld Epsilon`, default 1cm) antes de
   montar o grafo — isso resolve o caso comum. Se o `Debug.Log` do `RebuildGraph()` mostrar
@@ -828,6 +848,54 @@ de calibração pra esse tamanho de mapa é o **broad-phase**, não o pathfindin
 
 ## Limitações conhecidas / pontos de atenção
 
+- ~~**Agente preso para sempre num vértice (canto do funil).**~~ Resolvido — achado
+  rodando o pacote no mapa real do jogo (CF_Castles, ~28k triângulos em vários tiles):
+  0 de 64 agentes chegavam ao destino, todos com `MovementFaultType.NoProgress`, parados
+  exatamente em coordenadas de vértice. O funil coloca waypoints nos cantos (vértices) e,
+  depois do canto, o próximo triângulo do caminho muitas vezes só compartilha esse
+  VÉRTICE com o atual (não uma aresta). A 1ª camada do clamp
+  (`AvoidanceAndMoveJob.TestTriangleAndNeighbors`) só testa vizinhos de aresta e aceitava
+  o ponto mais próximo do triângulo atual mesmo com o agente já fora dele — o próprio
+  vértice —, então o agente era devolvido pro canto todo frame. Agora um triângulo que
+  contém a posição em XZ sempre vence um que não contém (a histerese de
+  `Triangle Sticky Margin` só desempata candidatos no mesmo caso), e se nenhum do 1-anel
+  contém a posição, o BFS por adjacência real (`Wall Safe Bfs Hops`, agora com visitados
+  deduplicados) procura antes de clampar na borda.
+- ~~**Agente "patinando" parado ao descer em direção a um alvo depois de uma crista.**~~
+  Resolvido — o clamp usava o ponto mais próximo em 3D. Com a posição fora da superfície
+  (a componente Y da velocidade aponta pro waypoint, não segue a inclinação local), a
+  projeção ao longo da normal de uma rampa tem componente XZ que empurrava o agente de
+  volta os mesmos centímetros que ele tinha andado. Quando a posição está em cima do
+  triângulo em XZ, o clamp agora projeta na VERTICAL (Y do plano naquele XZ), e pisos
+  sobrepostos são desempatados pela distância em Y.
+- ~~**T-junction entre tiles desconectava escadas/rampas (BestEffort onde o nativo
+  acha caminho).**~~ Resolvido — dois tiles vizinhos nem sempre subdividem a borda comum
+  nos mesmos pontos: um lado tem um vértice no meio de uma aresta que, do outro, é única,
+  e como o detail mesh do Recast amostra a altura por tile, esse vértice ainda fica alguns
+  cm fora da aresta vizinha (17cm numa escada do CF_Castles). A solda de vértices não pega
+  isso e a adjacência por índice não ligava os tiles ali — o topo das escadas só era
+  alcançável por NavMeshLinks de descida (mão única), então quem subia recebia
+  `PathStatus.BestEffort`. `NavMeshGraphBuilder.RepairTJunctions` agora divide o
+  triângulo da aresta longa nos vértices de borda do vizinho que caem sobre ela (2cm em
+  XZ, `T Junction Height Tolerance` em Y, default 0.3m; 0 desliga). O `Debug.Log` do
+  rebuild informa quantas foram reparadas. (A 1ª versão deste reparo varria a caixa
+  envolvente inteira de cada aresta de borda e levava ~12s por rebuild no mapa do jogo;
+  hoje as arestas são rasterizadas num grid e consultadas por vértice, ~0,2s, e o rebuild
+  em jogo roda em background — ver "Rebuild quando o NavMesh muda".)
+- ~~**Partida/pouso de NavMeshLink reprojetados no triângulo errado.**~~ Resolvido — a
+  ponta do link (com deslocamento lateral de `width`) era reprojetada com
+  `FindNearestTriangle` global, que às vezes escolhia um patch vizinho do outro lado de uma
+  borda: o funil mirava um ponto inalcançável e o agente ficava parado a 1-2m da partida do
+  link. Agora a ponta é projetada no próprio triângulo de partida/pouso do caminho do A*.
+- ~~**`PathStatus.PartialCorridor` parava no fim do corredor truncado.**~~ Resolvido —
+  caminhos com mais de `MaxCorridorPoints` (64) waypoints eram truncados e o agente parava
+  no último ponto pra sempre. `NavMeshJobManager.ContinuePartialCorridors` pede o resto do
+  caminho assim que o agente passa a mirar o último waypoint, sem parada visível.
+- **Off-mesh links gerados automaticamente pelo bake não são vistos.** Só componentes
+  `NavMeshLink` entram no grafo (ver seção "NavMeshLink"); links criados pelo próprio bake
+  (`Drop Height`/`Jump Distance`) não aparecem em `NavMesh.CalculateTriangulation()` nem
+  como componente. Vãos que o `NavMeshAgent` nativo atravessa por esses links ficam
+  desconectados aqui (`BestEffort`) — modele-os com `NavMeshLink`.
 - ~~**`NavMeshLink.width` ignorado — agentes simultâneos no mesmo link miravam a
   mesma linha central.**~~ Resolvido — ver seção "NavMeshLink" acima. Cada agente agora
   recebe um deslocamento lateral determinístico (sequência da razão áurea sobre
@@ -1149,9 +1217,8 @@ de calibração pra esse tamanho de mapa é o **broad-phase**, não o pathfindin
 | `Runtime/CustomNavMesh.Runtime.asmdef` | Assembly Definition do pacote (referencia Burst/Collections/Mathematics). |
 | `Runtime/NavMeshJobConstants.cs` | Constantes compartilhadas (`MaxCorridorPoints`, `MaxNavMeshAreas`). |
 | `Runtime/Data/NavMeshGraph.cs` | Struct com o NavMesh em NativeArrays. |
-| `Runtime/Data/NavMeshGraphBuilder.cs` | Ponte main-thread: `NavMesh.CalculateTriangulation()` → `NavMeshGraph`, incluindo solda de vértices duplicados entre tiles e coleta de `NavMeshLink` (`BuildLinks`). |
+| `Runtime/Data/NavMeshGraphBuilder.cs` | `NavMesh.CalculateTriangulation()` → `NavMeshGraph`: `BuildManaged` (solda de vértices entre tiles, slivers, T-junctions, adjacência — thread-safe, roda em background nos rebuilds em jogo), `ToNativeGraph` e coleta de `NavMeshLink` (`BuildLinks`). |
 | `Runtime/Data/NavMeshSpatialGrid.cs` | Grid uniforme XZ pra localizar triângulo por posição. |
-| `Runtime/Jobs/BuildTriangleAdjacencyJob.cs` | Descobre vizinhos de cada triângulo (1x por bake). |
 | `Runtime/Jobs/BuildTriangleGridJob.cs` | Monta o `NavMeshSpatialGrid` (1x por bake). |
 | `Runtime/Jobs/PathRequest.cs` | Struct de pedido de caminho. |
 | `Runtime/Jobs/FindPathsBatchJob.cs` | A* (incluindo arestas de `NavMeshLink`) + funnel/`BuildCorridorWithLinks`, em lote, por frame. |
